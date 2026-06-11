@@ -1,0 +1,452 @@
+9front/vz64 -- a 9front kernel port for Apple Virtualization.framework
+=======================================================================
+
+This document describes the vz64 kernel: a port of the 9front arm64
+kernel that runs as a guest under Apple's Virtualization.framework
+(VZ) on Apple silicon Macs.  It covers the architecture, the boot
+protocol, the build process, every VZ-specific adaptation, and the
+debugging lessons learned during bring-up.
+
+Status at time of writing: BOOTS TO AN INTERACTIVE RC PROMPT.
+hjfs root mounts from virtio-blk (/dev/sdF0/fs), bootfs and
+factotum run, glenda logs in, init starts rc:
+
+    Plan 9
+    timer frequency 24000000 Hz
+    cpu0: Apple Virtualization.framework
+    2047M memory: 822M kernel data, 1225M user, 7354M swap
+    ...
+    #l0: virtio10: 1000Mbps port 0x50030000 irq 65 ea dad82dd71e94
+    vz.bootfs: Thu Jun 11 10:19:23 GMT 2026
+    user[glenda]:
+    hjfs: fs is /dev/sdF0/fs
+    init: starting /bin/rc
+    %
+
+Known wrinkle: with service=terminal, termrc/profile try to bind
+#i (draw) and #m (mouse), which this kernel intentionally lacks
+(headless); the first rc dies on the profile and init restarts a
+bare rc.  Guard the profile, or boot service=cpu and use drawterm
+from the host for graphics.  Boot cmdline that works:
+
+    console=0 *ncpu=1 nobootprompt=local!/dev/sdF0/fs
+
+(virtio-blk disks are lettered from 'F' by sdvirtio10's viopnp;
+the first -disk is always sdF0.)
+
+
+1. Overview
+-----------
+
+Apple Virtualization.framework provides a lightweight hypervisor on
+Apple silicon.  Its VZLinuxBootLoader boots any kernel image that
+carries the Linux arm64 Image header; the guest starts at EL1 with
+a virtual GICv3, ARM generic timers, PSCI power management via HVC,
+and virtio 1.0 devices on a PCI ECAM.  No emulated legacy hardware
+exists at all: no 16550, no VGA, no PS/2, no SMBIOS.
+
+vz64 is derived from the 9front arm64 (qemu-virt) kernel.  The
+machine-specific layer was adapted for VZ's hardware model and a
+handful of hypervisor-specific behaviors that break assumptions
+baked into bare-metal ARM code.
+
+Source layout: /sys/src/9/vz64 (conventionally bound from a host
+directory during development).  Kernel configuration: "vz".
+
+Host-side runner: 9vz, a small Go harness over the Code-Hex/vz
+bindings (separate repository/directory).  It wires the virtio
+console to stdio, attaches a raw disk image via virtio-blk, NAT
+networking via virtio-net, an entropy device, and a vsock device,
+and passes the kernel command line via the device tree.
+
+
+2. Memory map
+-------------
+
+Guest RAM under VZ begins at physical (IPA) 0x70000000.  All
+addresses below are physical unless noted.
+
+    0x10000000  GICv3 distributor (GICD)
+    0x10010000  GICv3 redistributors (GICR)
+    0x20050000  PL031 RTC (VZ provides one)
+    0x20060000  PL061 GPIO
+    0x50000000+ PCI BARs (virtio devices; ECAM mapped via vmap)
+    0x70000000  VDRAM: guest RAM base (up to 2GB in current config)
+    0x70010000  CONFADDR: BOOTARGS area (64K)
+    0x70020000  REBOOTADDR: reboot trampoline
+    0x70100000  KTZERO: kernel text (load address)
+
+Virtual layout (KZERO = 0xFFFFFFFF00000000):
+
+    KZERO+pa            direct map of the first 4GB-ish (kaddr)
+    VIRTIO = KZERO+0x10000000   device window, PA = VA-KZERO
+    KMAP   = 0xFFFFFFFE00000000 high RAM mapping window
+    VMAP   = 0xFFFFFFFFF0000000 vmap arena (ECAM, BARs)
+
+The Mach structures live immediately below KTZERO (MACHADDR(n) =
+KTZERO-(n+1)*MACHSIZE), and the initial page tables (L1BOT/L1/L1TOP)
+below those.  See mem.h for the full picture.
+
+mmu0init maps the entire 2GB of VDRAM with 2MB blocks up front
+because VZ places the device tree blob near the top of guest RAM
+and it must be readable before meminit runs.
+
+
+3. Boot protocol and image format
+---------------------------------
+
+VZLinuxBootLoader requires the Linux arm64 Image header
+(linux/Documentation/arch/arm64/booting.rst): a 64-byte structure
+at offset 0 with executable code in the first two words and the
+magic "ARM\x64" at offset 56.
+
+vz64 embeds this header directly in l.s at _start:
+
+    WORD $0x14000010   code0: b .+64 (branch over the header)
+    WORD $0xD503201F   code1: nop
+    text_offset = 0x100000  (u64)
+    image_size  = 32MB      (u64)
+    flags       = 0x2       (LE, 4K pages, honor text_offset)
+    res2..res4  = 0
+    WORD $0x644D5241   magic "ARM\x64" at offset 56
+    res5        = 0
+
+The loader places the image at RAM base + text_offset =
+0x70100000 = KTZERO, so the header occupies the first 64 bytes of
+kernel text and all linked addresses are self-consistent.  Entry is
+at the image start; code0 branches over the header to the real
+startup code.
+
+CRITICAL SUBTLETY: code0 must be a raw WORD, not an assembler
+branch (B _hdrend(SB)).  The 7l linker's follow()/xfol pass chases
+unconditional branch instructions and lays the branch target's code
+at the branch site, scattering the header data words elsewhere in
+the text.  The linked addresses remain consistent, but the file no
+longer begins with a valid header and VZ refuses to start.  Encode
+the branch as data and the linker leaves everything in place.
+
+At entry (per the Linux boot protocol): R0 = physical address of
+the device tree blob, MMU state as the hypervisor left it, CPU at
+EL1.  l.s saves the DTB pointer and passes it to main(uintptr dtb).
+
+The kernel command line arrives via the DTB /chosen bootargs
+property (set with 9vz -cmdline); bootargsinit parses the DTB for
+bootargs, memory size, and CPU count.
+
+Build and boot:
+
+    # on Plan 9 (source bound at /sys/src/9/vz64)
+    cd /sys/src/9/vz64 && mk
+    # produces 9vz (a.out) and 9vz.u (uImage via aux/aout2uimage)
+
+    # on the mac
+    dd if=9vz.u of=9vz.bin bs=64 skip=1     # strip uImage header
+    ./9vz -kernel 9vz.bin -disk 9front.raw \
+        -cmdline 'console=0 ...'
+
+The dd strips aout2uimage's 64-byte U-Boot wrapper, exposing the
+embedded arm64 header at offset 0.  check_kernel.sh (in the 9vz
+repo) validates the header.  No further conversion is needed; the
+older mkarm64hdr.py prepend-a-header approach is obsolete (and
+will refuse to run on a binary that already has the magic).
+
+
+4. VZ-specific adaptations
+--------------------------
+
+4.1 LSE atomics instead of LDXR/STXR
+
+The single most important change.  Apple's hypervisor clears the
+CPU's exclusive monitor on every VM exit, and VM exits happen
+constantly (host timer interrupts, scheduling).  A classic
+LDXR/STXR loop can therefore livelock: the STXR always fails
+because the monitor was cleared between the paired instructions.
+The first casualty was the kernel print lock -- the kernel hung in
+quotefmtinstall() at boot, inside the very first lock() call.
+
+tas() and cmpswap() in l.s now use ARMv8.1 LSE single-instruction
+atomics, which do not involve the exclusive monitor:
+
+    tas:     SWPW  R1, R0, [R0]   encoded as WORD $0xB8218000
+    cmpswap: CASW  R1, R2, [R0]   encoded as WORD $0x88A17C02
+
+All Apple silicon supports LSE.  The instructions are WORD-encoded
+because 7a has no mnemonics for them.
+
+4.2 No PMU
+
+VZ guests have no performance monitor unit.  Writing PMCR_EL0,
+PMCNTENSET, or PMUSERENR_EL0 traps (undefined instruction).  The
+PMU setup in clockinit is removed, and lcycles() reads the virtual
+counter CNTVCT_EL0 instead of PMCCNTR_EL0.  All timekeeping and
+cycle counting use the ARM generic virtual timer/counter, which VZ
+implements fully:
+
+    CNTFRQ_EL0 reports 24 MHz
+    CNTVCT_EL0 is the cycle/tick source (vcycles, cycles macro)
+    CNTV_TVAL/CNTV_CTL drive the scheduler clock (IRQcntvns)
+
+4.3 PSCI via HVC
+
+Power state control is PSCI with HVC as the conduit:
+
+    0x84000002  CPU_OFF
+    0xC4000003  CPU_ON      (mpinit, secondary cpu start; note
+                             the SMC64 id -- VZ rejects the SMC32
+                             0x84000003 with NOT_SUPPORTED, since
+                             CPU_ON takes a 64-bit entry address)
+    0x84000008  SYSTEM_OFF  (vzstop debug helper)
+    0x84000009  SYSTEM_RESET (exit/reboot)
+
+hvccall() in l.s marshals a Ureg through the HVC.  The vzstop()
+helper (SYSTEM_OFF + spin) deserves special mention: it terminates
+the VM cleanly in a way that is observable from the host ("state:
+stopped" vs. a hang), which made it the fundamental debugging
+primitive during bring-up -- see section 6.
+
+4.4 GICv3
+
+intrinit drives the GICv3 at GICD 0x10000000 / GICR 0x10010000
+(gic.c).  This works under VZ as-is.  The virtio devices deliver
+PCI INTx-style interrupts through it (the ether probe above shows
+irq 65).
+
+4.5 Virtio 1.0 over PCI
+
+All I/O is virtio 1.0 ("modern") on a PCI ECAM:
+
+    uartvz.c        virtio-console = the system console
+    ethervirtio10   virtio-net
+    sdvirtio10      virtio-blk (SCSI-flavored sd)
+    usbxhcipci      XHCI (if VZ exposes one)
+
+pciqemu.c provides ECAM config access.  Device discovery is by
+vendor:device ID match (console is 0x1AF4:0x1043).
+
+4.6 The console (uartvz.c)
+
+VZ has no UART; the console is a virtio-console device wired by
+the 9vz harness to stdio.  Bring-up is two-phase because the
+console cannot exist until PCI is scanned:
+
+    uartconsinit (early)   installs a null console; putc appends
+                           to a 16K memory ring buffer
+    uartvzlink (links())   probes the PCI device, negotiates
+                           VERSION_1, sets up rx/tx vrings,
+                           flushes the ring buffer, switches to
+                           real virtio I/O, enables rx interrupts
+
+Until links() runs, ALL print output is invisible, buffered in the
+ring.  This shaped the whole early debugging experience (section 6).
+
+TX is polled and synchronous: putc posts single characters via
+descriptor 0 (iprint/panic path), kick posts batches via
+descriptor 1 (queued print path).  Both wait for the device to
+consume the descriptor before reusing it -- see the txwait bug in
+section 6.5 for why this wait must be real.
+
+4.7 DTB parsing
+
+bootargsinit (bootargs.c) walks the flattened device tree that VZ
+passes in R0: /chosen bootargs becomes the plan9.ini-style config,
+/memory reg sets *maxmem, /cpus/cpu* sets *ncpu.  VZ places the
+DTB near the top of guest RAM, which is why mmu0init maps all of
+VDRAM up front.
+
+4.8 Page table coexistence (mmu.c)
+
+l1map() skips L1 entries that already contain valid 2MB PTEBLOCK
+mappings (installed by mmu0init) instead of asserting they must be
+PTETABLE.  Without this, meminit -> kmapram -> l1map panicked into
+the invisible early console -- a silent hang.  The mmu0init block
+attributes (kernel RW, inner-shareable, write-back) are correct
+for RAM, so skipping is sound.
+
+
+5. What VZ provides (host harness summary)
+------------------------------------------
+
+The 9vz Go program (Code-Hex/vz bindings) configures:
+
+    VZLinuxBootLoader        kernel + command line (DTB /chosen)
+    virtio-console           on stdin/stdout, raw-ish termios
+    virtio-blk               raw disk image (-disk, -ro)
+    virtio-net               NAT, random locally-administered MAC
+    virtio-entropy
+    virtio-vsock             (for a future 9P control plane)
+    -cpus N (default 2), -mem GiB (default 2)
+
+Also supports -efi for EFI firmware boot as a fallback path.
+qcow2 images must be converted to raw first.
+
+
+6. Bring-up war stories (debugging notes for posterity)
+-------------------------------------------------------
+
+The early debugging environment was: no console output of any kind
+before links(), no JTAG, no hypervisor trace.  The only observable
+signal was vzstop() -- PSCI SYSTEM_OFF -- which makes the host
+print "state: stopped" instead of hanging forever.  Boot bugs were
+located by bisecting main() with vzstop probes, one VM launch at a
+time.  Lessons:
+
+6.1 The lock that wasn't (LDXR/STXR livelock)
+
+First hang: quotefmtinstall(), the first lock() in the boot path.
+The exclusive-monitor livelock (4.1) means ANY spinlock can hang a
+VZ guest even with zero contention.  If a bare-metal ARM kernel
+hangs mysteriously early under a hypervisor, suspect the monitor.
+
+6.2 The 64-byte lie (image load offset)
+
+For a long stretch, static variables appeared to contain garbage
+at boot: a Lock in the data segment was nonzero, zeroing it by
+address fixed one hang only to reveal another.  Heroic theories
+about cache writeback, MMU-disable being trapped, and linker BSS
+placement were tested and demolished one by one (skipping every
+physical-address operation in l.s changed nothing; zeroing all of
+BSS from C changed nothing).
+
+The actual bug: the image was being loaded 64 bytes off from the
+linked addresses by an external header-prepending tool with a
+wrong text_offset.  Every memory reference was self-consistent
+within the running kernel but shifted relative to the loaded
+image, so initialized data appeared corrupt.  One header fix and
+every "memory corruption" symptom evaporated.
+
+Moral: when symptoms say "memory is garbage but only sometimes",
+check the load address against the link address before anything
+else.
+
+6.3 The linker ate my header (7l follow pass)
+
+Embedding the arm64 Image header with "B _hdrend(SB)" as code0
+produced a binary whose header words were scattered: 7l's branch-
+following optimization relocated code into the header area.  Raw
+WORD encoding for code0 is mandatory.  (Detected because
+check_kernel.sh found garbage at the magic offset.)
+
+6.4 Small statics live in the data segment
+
+Plan 9 linkers promote uninitialized globals smaller than MINSIZ
+(64 bytes) into the data segment (dodata pass 1).  A static Lock
+is NOT between edata and end, and zeroing edata..end does not
+touch it.  This mattered during the load-offset hunt and is worth
+knowing whenever "BSS" assumptions are in play on Plan 9.
+
+6.5 txwait that didn't wait
+
+The virtio console's txwait() was a no-op (it advanced its own
+bookkeeping counter instead of waiting for the device's used
+index).  putc/kick then reused the descriptor and buffer while
+the asynchronous VZ backend was still reading them.  Symptoms:
+console text duplicated in blocks, then with individual characters
+doubled/interleaved ("110000MMbbpss..."), then TX wedging entirely
+-- which looked exactly like a kernel hang.  The fix is to spin
+until used->idx == avail->idx before reusing anything.
+
+Moral: under VZ the device side is a host thread, genuinely
+concurrent with the guest.  Polling drivers ported from
+synchronous-feeling environments (QEMU TCG) must actually wait.
+
+6.6 PMU is a trap (literally)
+
+See 4.2.  Writing PMU system registers undef-traps under VZ.  The
+writes were vestigial in clockinit but fatal once vectors were up,
+panicking into the invisible pre-links console buffer.
+
+6.7 General technique
+
+  - vzstop() bisection: move a single probe through main(),
+    rebuild, relaunch.  Clean stop = code above the probe works.
+  - One change per round.  Two theories tested at once cost more
+    than they save when both can hang identically.
+  - Distrust "it hangs" -- with a dead console TX queue, a healthy
+    kernel looks identical to a wedged one.  After the console is
+    live, "hangs" may just be output stalls.
+  - The build/boot loop spans two machines (Plan 9 build, mac
+    host).  Stale-binary mistakes (forgetting dd, the python tool
+    silently refusing and leaving an old .img) produced identical
+    output across "different" tests twice during bring-up.  When
+    output doesn't change at all, suspect the artifact pipeline,
+    not the code.
+
+
+7. Known issues and TODO
+------------------------
+
+  - Userspace bring-up: chandevreset completes through ether
+    probe; sd/virtio-blk discovery, userinit, schedinit, init0,
+    and the boot process are the current frontier.
+  - SMP: first attempt failed cleanly -- PSCI CPU_ON with the
+    SMC32 id 0x84000003 returns -1 NOT_SUPPORTED under VZ.  The
+    SMC64 id 0xC4000003 is now used (matches Linux) but is
+    UNTESTED.  The secondary path itself (BSS clear gated to
+    cpu0, WFE parking removed, per-cpu GIC/timer init) is
+    audited but has never executed under VZ.  Keep *ncpu=1 in
+    the cmdline until this is verified.
+  - main.c still calls fmtlclear() before quotefmtinstall(); this
+    was a workaround from the load-offset era and is almost
+    certainly removable now.  The corresponding helpers
+    (fmtlclear/fmtlwhere) added to /sys/src/9/port/print.c must
+    be reverted to stock before any sysupdate; they are the only
+    out-of-tree modification to shared port code.
+  - The C-level BSS zeroing loop at the top of main() may be
+    redundant now that the load offset is fixed (the l.s clear
+    may work, or may still be needed -- untested either way).
+    Harmless to keep.
+  - putc (iprint/panic) and kick (queued output) can in principle
+    race on the TX vring from interrupt context; they use separate
+    descriptors but share avail ring index updates.  Needs an
+    ilock or equivalent eventually.
+  - The early-boot ring buffer flush order vs. rx interrupt enable
+    could drop console input arriving during flush (cosmetic).
+  - rebootcode/reboot path untested under VZ (PSCI SYSTEM_RESET
+    works for exit; warm reboot into a new kernel is unexplored).
+  - vgasize/console settings in -cmdline are passed through but
+    no display device exists; framebuffer support via
+    VZVirtioGraphicsDevice would be a separate project.  The
+    practical graphics path today is service=cpu plus drawterm
+    from the host over the NAT subnet (rcpu/tcp17019, dp9ik);
+    see NOTES for the conversion recipe.
+  - The svcmode EL2 path in l.s is dead code under VZ (guests
+    enter at EL1) but retained for portability.
+
+
+8. File inventory (machine-specific)
+------------------------------------
+
+    l.s          entry, arm64 Image header, atomics (LSE), spl,
+                 cache/TLB ops, vectors, hvccall, vzstop
+    main.c       boot sequence, confinit, mpinit, reboot
+    mem.c        mmuidmap, mmu0init, meminit
+    mmu.c        kernel/user page tables, kmapram, l1map, asid
+    trap.c       vectors, syscall/trap/irq dispatch
+    gic.c        GICv3 distributor/redistributor
+    clock.c      generic virtual timer, no PMU
+    fpu.c        FP/SIMD context
+    uartvz.c     virtio-console driver (two-phase, see 4.6)
+    bootargs.c   DTB parsing, plan9.ini-style config
+    pciqemu.c    PCI ECAM config space access
+    sysreg.c     MSR/MRS access helpers
+    devrtc.c     PL031 RTC
+    dat.h        Mach, PFPU, MMMU, register conventions
+                 (m = R27, up = R26)
+    mem.h        memory map (section 2)
+    fns.h        prototypes, incl. vzstop/restoreregs debug aids
+    io.h         IRQ numbers, device addresses
+    vz           kernel configuration (devices: section 5 list)
+    mkfile       build rules (objtype=arm64, loadaddr, aout2uimage)
+    NOTES        raw bring-up log (the unpolished version of
+                 section 6)
+
+
+9. Provenance
+-------------
+
+This port was developed by a human engineer and an LLM assistant
+working together over a claude9 session on the target Plan 9
+system, with the human running all builds and VM launches and the
+assistant editing source and reasoning about failures.  Take that
+as you will; the bugs were real, the fixes are readable, and the
+kernel says Plan 9 on an Apple hypervisor either way.

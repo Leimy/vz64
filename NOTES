@@ -1,0 +1,342 @@
+vz64 kernel bringup notes
+=========================
+
+Platform: 9front kernel running as guest under Apple Virtualization.framework
+Guest starts at EL1 (hypervisor at EL2).  Host-side runner: 9vz (mac).
+
+Build / image workflow
+----------------------
+The linker output 9vz goes through aux/aout2uimage producing 9vz.u
+(64-byte uImage header + text + data).  On the mac side:
+
+  dd if=9vz.u of=9vz.bin bs=64 skip=1     # strip uImage header
+  ./9vz -kernel 9vz.bin ...               # boot it directly
+
+l.s now embeds an ARM64 Linux-style boot header at _start:
+  code0 = B _hdrend (jumps over the 64-byte header)
+  text_offset = 0x100000  (image loads at RAM base + 0x100000 = KTZERO)
+  image_size  = 32MB
+  flags       = 0x2 (LE, 4K pages, image near RAM base)
+  magic       = "ARM\x64" at offset 56
+
+IMPORTANT: do NOT also run mkarm64hdr.py on the new binary.  That
+tool prepends a second header with text_offset=0xfffc0 (it assumed
+the header was NOT part of the linked text).  The two schemes must
+not be mixed.  The python tool was the old workaround; the embedded
+header replaces it.
+
+GOTCHA (bit us once): mkarm64hdr.py detects the embedded header
+(magic at offset 56) and exits WITHOUT writing the output file.
+If you keep step 3 in the build script, step 4 silently boots a
+STALE 9vz.img from a previous build.  Boot 9vz.bin directly:
+  ./9vz -kernel 9vz.bin -disk ... -cmdline '...'
+
+ROOT CAUSE of the long "data segment garbage" hunt (was Bug 2):
+the image was being loaded at the wrong offset.  The old python
+header pass put the text at a 64-byte offset from where the linker
+expected it (text_offset mismatch).  Every symbol ended up reading
+memory 64 bytes off (or worse), which presented as "static
+variables contain garbage".  fmtlclear() "worked" only because it
+zeroed whatever was at the (shifted) &fmtl.  Bulk-zeroing
+bdata..end "didn't work" because it wiped shifted initialized data
+and crashed.  None of l.s was ever corrupting anything -- skipping
+every physical-address op changed nothing because the corruption
+was a load-time layout problem.
+
+With the header fixed: quotefmtinstall and bootargsinit pass
+without any zeroing hacks.  (fmtlclear may now be unnecessary --
+UNTESTED, try removing it once boot gets further.)
+
+Bug 1: LDXR/STXR livelock (FIXED)
+----------------------------------
+Apple VZ clears the exclusive monitor on guest exits, so LDXR/STXR
+loops in tas() and cmpswap() can livelock.  Replaced with ARMv8.1
+LSE atomics in l.s:
+  tas:     SWPW  (WORD $0xB8218000)
+  cmpswap: CASW  (WORD $0x88A17C02)
+All Apple Silicon supports LSE.
+
+Bug 2: image load offset (FIXED -- see workflow above)
+-------------------------------------------------------
+Historical test results from this hunt, kept for reference:
+  - Plan 9 7l places static uninitialized vars < MINSIZ (64 bytes)
+    in the DATA segment, not BSS (dodata pass 1 promotes small
+    SBSS to SDATA).  True, but was a red herring.
+  - fmtlwhere() confirmed &fmtl < edata (in data segment).
+  - The l.s physical-address ops (mmudisable, cache flushes,
+    _zerol1, _zerobss, mmuidmap, mmu0init) were each/all skipped
+    with no change -- they were never the problem.
+
+Bug 4: embedded header scrambled by linker (FIX APPLIED)
+---------------------------------------------------------
+First attempt at the embedded header used "B _hdrend(SB)" as
+code0.  check_kernel.sh showed garbage at offset 56 instead of the
+magic: 7l's follow()/xfol pass chases unconditional branches and
+lays the target code at offset 0, scattering the header WORDs.
+Linked addresses stay self-consistent, but the file no longer
+starts with the header, so VZ rejects it ("failed to start").
+
+Fix: encode code0 as WORD $0x14000010 (b .+64) so the linker sees
+only data, never a branch to chase.  Same trick mkarm64hdr.py uses.
+
+Until the embedded header is verified by check_kernel.sh, the
+python-tool path (text_offset 0xfffc0 on a plain binary) still
+works and was used to verify meminit below.
+
+Bug 3: meminit hang (FIXED, VERIFIED)
+--------------------------------------
+mmu0init maps all 2GB of VDRAM with 2MB PTEBLOCK entries.  Later
+meminit->kmapram->l1map walks the same range and hit
+  assert((l1[PTL1X(va,1)] & PTETABLE) == PTETABLE)
+on those PTEBLOCK entries.  assert -> panic -> print before
+printinit = silent hang.
+
+Fix in mmu.c l1map(): if an L1 entry is already a valid PTEBLOCK,
+skip forward to the next 2MB boundary instead of asserting.  The
+mmu0init mapping attributes (kernel RW, inner-share, WB cache) are
+fine for RAM, so skipping is correct.
+
+VERIFIED: meminit fix works (vzstop after meminit fired cleanly).
+VERIFIED: embedded header works -- check_kernel.sh validates
+9vz.bin and VZ boots it directly, no python step.
+VERIFIED: confinit, xinit, printinit, print all pass (vzstop after
+print fired cleanly).
+
+Full boot attempt HUNG somewhere in: trapinit, fpuinit, intrinit,
+clockinit, cpuidprint, timersinit, pageinit, procinit0, initseg,
+links, chandevreset, userinit, mpinit, mmu1init, schedinit.
+
+PRIME SUSPECT: clockinit writes PMU registers (PMCR_EL0,
+PMCNTENSET, PMUSERENR_EL0).  Apple VZ does not give guests a PMU;
+those syswr()s likely take an undefined-instruction trap.  Vectors
+are installed by then (trapinit ran), so it probably panics into
+the invisible buffered console.  Related: lcycles() reads
+PMCCNTR_EL0 -- same problem whenever something calls it.
+
+VERIFIED: trapinit, fpuinit, intrinit all pass (probe between
+intrinit and clockinit stopped cleanly).  The GIC works under VZ.
+
+Bug 5: PMU registers unimplemented under VZ (FIX APPLIED)
+----------------------------------------------------------
+clockinit wrote PMCR_EL0/PMCNTENSET/PMUSERENR_EL0; Apple VZ guests
+have no PMU, so those syswr()s trap (vectors installed by then ->
+panic into invisible buffered console -> silent hang).  The PMU
+was vestigial anyway: cycles() uses vcycles()/CNTVCT_EL0.
+  - clock.c: PMU writes commented out.
+  - l.s: lcycles() now reads CNTVCT_EL0 instead of PMCCNTR_EL0.
+(Untested as the hang cause -- we fixed it on suspicion and moved
+the probe past it; if the next round hangs, the remaining parts of
+clockinit are still candidates: CNTV_TVAL/CTL writes, CNTKCTL,
+intrenable(IRQcntvns).)
+
+VERIFIED: clockinit (de-PMU'd), cpuidprint, timersinit, pageinit,
+procinit0, initseg, links ALL PASS.  Virtio console is UP: PCI
+enumeration messages appeared on the host terminal before the
+clean vzstop.  Bisection era over -- failures should now print.
+
+Bug 6: uartvz txwait did not wait (FIX APPLIED)
+------------------------------------------------
+txwait() was:
+    while(q->lastused != q->used->idx)
+        q->lastused++;
+i.e. lastused = used->idx -- a no-op that never waits for the
+DEVICE.  putc/kick/ringflush all do txpost(); txwait(); and then
+reuse the same descriptor + buffer for the next chunk.  The VZ
+console backend is asynchronous: stale avail entries pointing at
+a rewritten descriptor/buffer get processed late, emitting
+duplicated/interleaved text, and a sufficiently confused ring
+wedges TX entirely.
+
+Observed symptoms, all from this one bug:
+  - whole PCI message block printed twice (sequential dup)
+  - chandevreset's ether probe line with every char ~doubled
+    ("110000MMbbpss pp oo rr tt..." = two skewed copies racing)
+  - console output freezing mid-line (the "hang" -- guest may
+    well still be running with a dead TX queue)
+
+Fix: txwait now spins until used->idx == avail->idx (both
+free-running u16; equal = queue idle), with coherence() as
+read/compiler barrier, then syncs lastused.
+
+VERIFIED after txwait fix: full clean boot output through
+chandevreset's ether probe -- xinit hole report, "Plan 9" banner,
+timer frequency, cpu0 banner, memory summary, single-copy PCI
+enumeration, #l0 virtio10 1000Mbps with MAC.  The "missing early
+prints" and both doubling symptoms are all gone; they were all the
+txwait bug.
+
+MILESTONE: FULL BOOT TO INTERACTIVE RC PROMPT.  hjfs root from
+/dev/sdF0/fs, glenda login, % prompt on the virtio console.  The
+fmtlclear removal survived (load-offset theory confirmed).  Only
+wrinkle: terminal-service profile wants #i/#m (draw/mouse) which
+the headless kernel lacks; first rc dies, init restarts a bare rc.
+Options: guard profile / service=cpu + drawterm / someday
+virtio-gpu.
+
+Next projects, roughly in order:
+  - networking smoke test (ip/ipconfig over virtio-net NAT)
+  - service=cpu + auth + drawterm from the mac
+  - SMP bring-up (remove *ncpu=1, then -cpus N)
+  - virtio-gpu + devdraw/devmouse for native graphics
+  - console quirks: putc/kick vring race, rx-during-flush
+
+CPU server + drawterm recipe
+----------------------------
+Networking: Apple NAT serves DHCP on its shared subnet
+(typically 192.168.64.0/24); host can reach guest directly,
+outside world cannot.  In guest:
+    ip/ipconfig
+    cat /net/ipifc/0/status     # note guest IP for drawterm
+    ndb/dnsquery 9front.org ip  # if it fails: ndb/dns -r
+
+Conversion (FQA chapter 7 flow, grounded in auth(8)/rcpu(1)):
+  1. ls /dev/sdF0 -- must have an nvram partition (else disk/prep)
+  2. auth/wrkey            # machine key, authid=glenda, authdom=vz
+  3. /lib/ndb/local: add
+         auth=vz authdom=vz
+         ipnet=vznet ip=192.168.64.0 ipmask=255.255.255.0
+             auth=vz
+             authdom=vz
+  4. host side: add service=cpu to -cmdline; reboot.
+     cpurc path: no termrc (no #i/#m errors), aux/listen serves
+     /rc/bin/service including tcp17019 (rcpu, dp9ik+TLS).
+  5. auth/changeuser glenda    # password for drawterm logins
+  6. mac: 9front drawterm (git.9front.org/plan9front/drawterm),
+     drawterm -h <guest-ip> -a <guest-ip> -u glenda
+
+Snags: missing nvram partition -> prompts every boot; cpurc may
+need ip/ipconfig in cpurc.local; authdom mismatch ndb vs wrkey ->
+auth/debug on guest; DHCP IP drift -> pin with ether=/ip= in ndb.
+
+GOTCHA: on the mac, bridge100's 192.168.64.1 is the HOST/gateway
+address, not the guest.  Find the guest IP with
+cat /net/ipifc/0/status (guest) or arp -a | grep <guest-mac>
+(mac; the MAC is in the #l0 boot banner).  Debug order:
+ping guest-ip, then nc -vz guest-ip 17019 (listener exists only
+on a service=cpu boot with aux/listen running), then drawterm.
+
+WORKING: drawterm in via listen1 + factotum plaintext (cheap but
+fine inside the NAT).  To persist the rig across boots, put the
+commands in /cfg/$sysname/cpurc.  Run fshalt before stopping the
+VM -- hjfs buffers writes.
+
+Persistence boundary: hjfs/nvram changes live in 9front.raw; the
+KERNEL does not (VZ loads 9vz.bin fresh each launch -- guest never
+needs a kernel install), and the cmdline is per-launch via DTB.
+
+SMP preparation (FIXES APPLIED, UNTESTED)
+------------------------------------------
+Audit of the secondary path found one catastrophic bug and one
+hang risk, both fixed:
+  - main.c: the BSS clear ran BEFORE the machno check, so a
+    secondary entering main() would zero live BSS under the
+    running system.  Now gated on m->machno == 0 (cpu0's Mach is
+    zeroed by l.s; secondaries get machno from mpinit).
+  - l.s: removed the SEVL/WFE park before mmuenable.  Spin-table
+    legacy; with PSCI CPU_ON the tables exist before a secondary
+    ever runs, and under VZ a WFE really waits while nobody SEVs.
+  - mpinit: PSCI CPU_ON return value now checked and printed on
+    failure (was silently hanging in synccycles).
+
+Looks sound by inspection: PSCI entry hits the executable header
+code0; MPIDR aff0 indexes Mach (mpinit constructs target mpidr to
+match); per-cpu GICR/VBAR/CNTV setup inherited from the SMP arm64
+port; LSE atomics are SMP-correct; shared L1BOT/L1TOP.
+
+TESTED: boot without *ncpu=1 reached mpinit and printed
+    mpinit: PSCI CPU_ON cpu1 failed: -1
+-1 = PSCI NOT_SUPPORTED.  We were calling the SMC32 function id
+0x84000003; CPU_ON takes a 64-bit entry point and the SMC64 id is
+0xC4000003 (what Linux uses on arm64).  The argument-less PSCI
+calls (SYSTEM_OFF 0x84000008, SYSTEM_RESET 0x84000009) only exist
+as SMC32 and have worked all along, which fits: Apple implements
+exactly the spec'd ids, QEMU is lenient about the 32-bit CPU_ON.
+FIX APPLIED in mpinit (0xC4000003), UNTESTED.  Boot once without
+*ncpu=1 when convenient; the failure print makes the outcome
+unambiguous either way.  Single-cpu boots are unaffected (mpinit
+loop body never runs with conf.nmach == 1).
+KNOWN RISK: uartvz TX path has no lock; concurrent prints from
+two cpus can race the vring (garbled console).  If seen, the fix
+is an ilock around txpost/txwait in putc/kick -- already on the
+TODO list, not a mystery.
+
+Root filesystem facts:
+  - sdvirtio10 viopnp letters virtio-blk disks from 'F': the
+    first -disk is sdF0, NOT sdN0.  cmdline should say
+    nobootprompt=local!/dev/sdF0/fs
+  - /dev/sdF0/fs only exists after bootrc runs disk/fdisk +
+    disk/prep on the plan9 partition inside the image.
+  - to discover interactively: omit nobootprompt once; the
+    bootrc prompt's bracketed default is what probing found;
+    !rc gives a rescue shell.
+  - the root image must contain an arm64 userland (/arm64/bin,
+    /arm64/init); an amd64-only install image will mount and
+    then fail to exec init.
+  - keep *ncpu=1 in cmdline until SMP bring-up is its own
+    project (mpinit/PSCI CPU_ON plumbing exists but untested;
+    the embedded header's code0 is executable so secondaries
+    entering at _start are safe).
+
+See PORT.txt for the full write-up of the port.
+
+STATUS: probe removed entirely; full boot attempt.  Remaining
+stretch: chandevreset, userinit, mpinit, mmu1init, schedinit ->
+init0 -> touser -> /boot.  chandevreset will probe virtio-blk
+(sdvirtio10) and virtio-net; expect device chatter.  mpinit will
+try PSCI CPU_ON for cpu1 (9vz defaults to -cpus 2) -- if weird
+hangs appear with no message, retry with -cpus 1 to take
+secondary-cpu bringup out of the equation.
+
+KEY MILESTONE: links() runs uartvzlink which brings up the virtio
+console.  All print() output buffered so far flushes to the host
+terminal at that point.  If we see "Plan 9" on the serial console,
+bisection-by-vzstop is over; from then on we debug by reading
+panic/fault messages like civilized people.
+
+Risk notes for this stretch:
+  - intrinit: GICv3 (GICD 0x10000000, GICR 0x10010000 per mem.h).
+    Apple VZ provides a virtual GICv3; mappings must match.
+  - clockinit/timersinit: generic virtual timer via CNTV; VZ
+    supports it, FIQ vs IRQ routing may need attention.
+  - mpinit: starts secondary cpus via PSCI CPU_ON HVC calls.
+    9vz defaults to -cpus 2 and the DTB advertises them, so
+    conf.nmach will be 2.  Secondary bringup (_startup WFE path)
+    is brand-new territory.  For the first full-boot attempt,
+    running 9vz with -cpus 1 removes this variable.
+  - fmtlclear() in main.c is probably obsolete now that the load
+    offset is fixed; remove it (and the print.c helpers) once the
+    system boots -- one variable at a time.
+
+Recent l.s changes (this round):
+  - Embedded ARM64 boot header at _start (see above).
+  - Removed accidental duplicate svcmode call in _hdrend
+    (was: MOV $setSB / BL svcmode twice in a row).
+
+Debugging tools:
+  - vzstop(): HVC SYSTEM_OFF (0x84000008) + spin; clean VM exit
+    observable from the host.  Declared in fns.h.
+  - restoreregs(): reload R27 from TPIDR_EL1, R26=0 (l.s).
+  - No console output until virtio console comes up in links();
+    uartvz putc only fills a memory ring buffer before that, so
+    early print() is invisible.  vzstop is the only early signal.
+
+Known boot sequence status:
+  works: _start, svcmode, mmuenable, machinit, uartconsinit,
+         quotefmtinstall, bootargsinit (DTB parse OK)
+  fix applied, verifying: meminit
+  untested beyond: confinit, xinit, printinit, print, trapinit,
+         fpuinit, intrinit, clockinit, timersinit, pageinit, ...
+
+Changes to files OUTSIDE vz64: REVERTED.
+  - /sys/src/9/port/print.c restored to stock (fmtlclear/fmtlwhere
+    removed), fns.h declarations removed, main.c call removed.
+    Verify with: bind -ac /dist/9front / && git/diff
+    sys/src/9/port/print.c; authoritative restore: git/revert.
+  - NEXT BUILD IS A TEST: boot without fmtlclear() should still
+    work now that the image load offset is fixed.  If the old
+    quotefmtinstall hang returns, the load-offset theory of the
+    fmtl garbage was incomplete.
+    Once boot works without fmtlclear(), revert this file to stock
+    (static Lock fmtl + _fmtlock/_fmtunlock/_efgfmt only) and
+    remove the fmtlclear()/fmtlwhere() declarations from fns.h
+    and the fmtlclear() call from main.c.
