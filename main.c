@@ -132,7 +132,10 @@ void
 mpinit(void)
 {
 	extern void _start(void);
+	uvlong mpid, self;
 	int i;
+
+	self = sysrd(MPIDR_EL1) & 0xFF00FFFFFFULL;	/* aff3..aff0, drop flags */
 
 	for(i = 1; i < conf.nmach; i++){
 		Ureg u = {0};
@@ -140,14 +143,32 @@ mpinit(void)
 		MACHP(i)->machno = i;
 		cachedwbinvse(MACHP(i), MACHSIZE);
 
+		/*
+		 * target_cpu is an MPIDR affinity value.  Prefer the
+		 * one the device tree advertised for this cpu; the
+		 * Apple/VZ affinity layout does not necessarily put
+		 * the cpu index in aff0, so synthesising aff0 = i
+		 * (as the qemu port does) can name the wrong cpu or
+		 * none at all.  Fall back to aff0 = i only if the DTB
+		 * gave us nothing.
+		 */
+		if(i < ncpumpid)
+			mpid = cpumpid[i] & 0xFF00FFFFFFULL;
+		else
+			mpid = (self & ~0xFFULL) | i;
+
 		u.r0 = 0xC4000003;	/* CPU_ON (SMC64: 64-bit entry arg; VZ rejects the SMC32 0x84000003 with NOT_SUPPORTED) */
-		u.r1 = (sysrd(MPIDR_EL1) & ~(0xFF0000FFULL)) | i;
+		u.r1 = mpid;
 		u.r2 = PADDR(_start);
-		u.r3 = i;
+		u.r3 = i;		/* context_id: secondary's machno, passed in R0 */
+		if(getconf("*smpdebug") != nil)
+			iprint("mpinit: CPU_ON cpu%d mpid %#llux (dtb cpumpid[%d] %#llux ncpumpid %d) entry %#llux\n",
+				i, mpid, i, (i < ncpumpid) ? cpumpid[i] : 0ULL,
+				ncpumpid, (uvlong)PADDR(_start));
 		hvccall(&u);
 		if(u.r0 != 0)
-			print("mpinit: PSCI CPU_ON cpu%d failed: %lld\n",
-				i, (vlong)u.r0);
+			print("mpinit: PSCI CPU_ON cpu%d (mpid %#llux) failed: %lld\n",
+				i, mpid, (vlong)u.r0);
 	}
 	synccycles();
 }
@@ -175,13 +196,33 @@ main(uintptr dtb)
 	}
 	machinit();
 	if(m->machno){
+		/*
+		 * Secondary bringup.  With *smpdebug set, each stage
+		 * announces itself BEFORE running, so if a secondary
+		 * wedges or faults silently the last "cpuN main:" line
+		 * on the console names the stage that hung (a stuck
+		 * secondary otherwise produces no output at all, and
+		 * can also hang cpu0 in the synccycles barrier below --
+		 * see clock.c).  iprint is used: it does not depend on
+		 * this cpu's clock/scheduler being up yet.  Quiet by
+		 * default now that SMP boots cleanly.
+		 */
+		int dbg = getconf("*smpdebug") != nil;
+
+		if(dbg) iprint("cpu%d main: trapinit\n", m->machno);
 		trapinit();
+		if(dbg) iprint("cpu%d main: fpuinit\n", m->machno);
 		fpuinit();
+		if(dbg) iprint("cpu%d main: intrinit\n", m->machno);
 		intrinit();
+		if(dbg) iprint("cpu%d main: clockinit\n", m->machno);
 		clockinit();
 		cpuidprint();
+		if(dbg) iprint("cpu%d main: synccycles\n", m->machno);
 		synccycles();
+		if(dbg) iprint("cpu%d main: timersinit\n", m->machno);
 		timersinit();
+		if(dbg) iprint("cpu%d main: mmu1init\n", m->machno);
 		mmu1init();
 		m->ticks = MACHP(0)->ticks;
 		schedinit();

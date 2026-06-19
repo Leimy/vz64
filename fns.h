@@ -120,6 +120,7 @@ extern void intrenable(int, void (*)(Ureg*, void*), void*, int, char*);
 extern void intrdisable(int, void (*)(Ureg*, void*), void*, int, char*);
 extern int irq(Ureg*);
 extern void fiq(Ureg*);
+extern void dumprregs(void);
 
 /* sysreg */
 extern uvlong	sysrd(ulong);
@@ -170,6 +171,10 @@ extern void pciintrdisable(int tbdf, void (*f)(Ureg*, void*), void *a);
 
 /* bootargs */
 extern void bootargsinit(uintptr);
+extern uvlong cpumpid[];
+extern int ncpumpid;
+extern uvlong gicdbase, gicdsize;
+extern uvlong gicrbase, gicrsize;
 
 /* mostly for debugging */
 extern void vzstop(void);

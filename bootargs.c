@@ -12,6 +12,29 @@ static char maxmem[256];
 static int cpus;
 static char ncpu[256];
 
+/*
+ * MPIDR/affinity value of each cpu, taken from the `reg`
+ * property of the /cpus/cpu@N device-tree nodes.  Under VZ
+ * (and on real Apple silicon) the affinity layout is not
+ * guaranteed to put the cpu index in aff0, so mpinit must
+ * use these real values when starting secondaries with PSCI
+ * CPU_ON rather than synthesising aff0 = machno.
+ */
+uvlong	cpumpid[MAXMACH];
+int	ncpumpid;
+
+/*
+ * GIC distributor and redistributor regions, taken from the
+ * `reg` property of the interrupt-controller (arm,gic-v3) node.
+ * The redistributor base/size let getrregs() bound its frame
+ * walk to the region the hypervisor actually advertises instead
+ * of guessing the per-cpu stride (which differs between GICv3
+ * and GICv4/VLPI layouts).  Zero size means "not found, fall
+ * back to the compiled-in PHYSIO offset".
+ */
+uvlong	gicdbase, gicdsize;
+uvlong	gicrbase, gicrsize;
+
 static int
 findconf(char *k)
 {
@@ -85,11 +108,94 @@ beget4(uchar *p)
 	return (u32int)p[0]<<24 | (u32int)p[1]<<16 | (u32int)p[2]<<8 | (u32int)p[3];
 }
 
+static uvlong
+beget8(uchar *p)
+{
+	return (uvlong)beget4(p)<<32 | beget4(p+4);
+}
+
+/*
+ * Remember which device-tree node is the GICv3 interrupt
+ * controller.  We can't rely on the node *name* (VZ may call it
+ * intc@, gic@, interrupt-controller@, or something Apple-specific),
+ * so we latch onto the node whose `compatible` property contains
+ * "gic-v3".  Properties of a node are visited in order and
+ * `compatible` conventionally precedes `reg`, so by the time we
+ * see this node's `reg` we have already recorded its path here.
+ */
+static char gicpath[1024];
+
+static int
+ingicnode(char *path)
+{
+	int n;
+
+	if(gicpath[0] == 0)
+		return 0;
+	n = strlen(gicpath);
+	return strncmp(path, gicpath, n) == 0
+		&& (path[n] == 0 || path[n] == '/');
+}
+
+static int
+memhas(void *buf, int len, char *s)
+{
+	char *p, *e;
+	int n;
+
+	n = strlen(s);
+	p = buf;
+	for(e = p + len - n; p <= e; p++)
+		if(memcmp(p, s, n) == 0)
+			return 1;
+	return 0;
+}
+
 static void
 devtreeprop(char *path, char *key, void *val, int len)
 {
 	uvlong addr;
 	uchar *p = val;
+
+	/*
+	 * Identify the GIC node by its compatible string.  `compatible`
+	 * is a list of NUL-separated strings; match a substring so
+	 * "arm,gic-v3" (and Apple variants) are caught.
+	 */
+	if(strcmp(key, "compatible") == 0 && memhas(val, len, "gic-v3")){
+		if(strlen(path) < sizeof(gicpath))
+			strecpy(gicpath, gicpath+sizeof(gicpath), path);
+		return;
+	}
+
+	/*
+	 * GICv3 interrupt-controller node.  Its `reg` is a list of
+	 * (base,size) regions encoded with the parent bus's
+	 * #address-cells/#size-cells, which is 2/2 under VZ (64-bit
+	 * cells).  Region 0 is the distributor, region 1 the
+	 * redistributors.  We match the node by the compatible-string
+	 * path latched above; fall back to a name match for DTBs we
+	 * happened to see before `compatible`.
+	 */
+	if(strcmp(key, "reg") == 0
+	&& (ingicnode(path)
+	   || (gicpath[0] == 0
+	      && (strstr(path, "/intc") != nil
+	         || strstr(path, "/interrupt-controller") != nil
+	         || strstr(path, "/gic") != nil)))){
+		if(len >= 32){		/* 2/2 cells: two 64-bit (base,size) pairs */
+			gicdbase = beget8(p+0);
+			gicdsize = beget8(p+8);
+			gicrbase = beget8(p+16);
+			gicrsize = beget8(p+24);
+		} else if(len >= 16){	/* 1/1 cells: two 32-bit (base,size) pairs */
+			gicdbase = beget4(p+0);
+			gicdsize = beget4(p+4);
+			gicrbase = beget4(p+8);
+			gicrsize = beget4(p+12);
+		}
+		return;
+	}
 
 	if((strncmp(path, "/memory", 7) == 0 || strncmp(path, "/memory@0", 9) == 0)
 	&& strcmp(key, "reg") == 0){
@@ -103,6 +209,22 @@ devtreeprop(char *path, char *key, void *val, int len)
 		return;
 	}
 	if(strncmp(path, "/cpus/cpu", 9) == 0 && strcmp(key, "reg") == 0){
+		/*
+		 * The cpu node's reg is the MPIDR affinity value.
+		 * It is normally a single 32-bit cell, but a
+		 * #address-cells=2 layout encodes it as two cells
+		 * (big-endian, high cell first).  Record it so
+		 * mpinit can target the real cpu with PSCI CPU_ON.
+		 */
+		if(ncpumpid < MAXMACH){
+			if(len >= 8)
+				cpumpid[ncpumpid] = (uvlong)beget4(p)<<32 | beget4(p+4);
+			else if(len >= 4)
+				cpumpid[ncpumpid] = beget4(p);
+			else
+				cpumpid[ncpumpid] = cpus;
+			ncpumpid++;
+		}
 		cpus++;
 		return;
 	}
@@ -196,6 +318,18 @@ bootargsinit(uintptr dtb)
 			addconf("*ncpu", ncpu);
 		}
 	}
+	/*
+	 * Quiet by default now that SMP works; set *gicdebug in the
+	 * kernel config to dump the captured GIC layout (handy if the
+	 * DTB parse ever needs revisiting on a new VZ version).
+	 */
+	if(getconf("*gicdebug") != nil)
+		iprint("bootargsinit: gic node %q\n"
+			"  gicd base %#llux size %#llux\n"
+			"  gicr base %#llux size %#llux  (%d cpus -> per-cpu %#llux)\n",
+			gicpath[0] ? gicpath : "(not found by compatible)",
+			gicdbase, gicdsize, gicrbase, gicrsize,
+			cpus, (cpus > 0 && gicrsize != 0) ? gicrsize/cpus : 0ULL);
 }
 
 char*

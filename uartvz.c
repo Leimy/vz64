@@ -71,6 +71,16 @@ struct Vqueue
 static struct {
 	int	ready;
 
+	/*
+	 * Serialises the TX vring across cpus.  putc (iprint/
+	 * panic) and kick (queued print output) both post to and
+	 * wait on the single tx queue; without this lock two cpus
+	 * can interleave descriptor/avail updates and corrupt or
+	 * wedge the ring.  It is an ilock because putc runs from
+	 * interrupt context.
+	 */
+	Lock	txl;
+
 	Pcidev	*pci;
 
 	Vio	cfg;
@@ -273,6 +283,7 @@ kick(Uart *uart)
 		return;
 	}
 
+	ilock(&vcon.txl);
 	n = 0;
 	for(;;){
 		if(uart->op >= uart->oe && uartstageoutput(uart) == 0)
@@ -290,6 +301,7 @@ kick(Uart *uart)
 		txpost(&vcon.tx, 1, vcon.kickbuf, n);
 		txwait(&vcon.tx);
 	}
+	iunlock(&vcon.txl);
 }
 
 static void
@@ -368,10 +380,12 @@ putc(Uart*, int c)
 		ringbuf[ringw++ % sizeof(ringbuf)] = c;
 		return;
 	}
+	ilock(&vcon.txl);
 	txwait(&vcon.tx);
 	vcon.putcbuf[0] = c;
 	txpost(&vcon.tx, 0, vcon.putcbuf, 1);
 	txwait(&vcon.tx);
+	iunlock(&vcon.txl);
 }
 
 void

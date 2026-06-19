@@ -93,19 +93,193 @@ static Lock vctllock;
 static Vctl *vctl[MAXMACH][32], *vfiq;
 static u32int *dregs = (u32int*)VIRTIO;
 
+/*
+ * Pack an MPIDR_EL1 value into the 32-bit affinity layout used by
+ * GICR_TYPER[63:32] (Aff3<<24 | Aff2<<16 | Aff1<<8 | Aff0).  MPIDR
+ * keeps Aff3 up at bits [39:32]; the GIC affinity word keeps it at
+ * [31:24], so it has to be shifted down separately from Aff2..0.
+ */
+static u32int
+mpidraff(uvlong mpidr)
+{
+	return (u32int)((mpidr & 0xFFFFFFULL)		/* Aff2:Aff1:Aff0 */
+		| ((mpidr >> 32) & 0xFFULL) << 24);	/* Aff3 */
+}
+
+/*
+ * Find the GIC redistributor for a given cpu.
+ *
+ * On a conforming GICv3 each redistributor is identified by the
+ * MPIDR affinity the GIC reports in GICR_TYPER[63:32], and that is
+ * our preferred match (works on real hardware and on qemu).
+ *
+ * Apple VZ does not cooperate: its redistributor GICR_TYPER reads
+ * back as ALL ZEROES for every cpu -- both the affinity word
+ * [63:32] and the low word (Processor_Number, Last, VLPIS) are 0
+ * (see the dumprregs output: cpu0 and cpu1 both show aff 0,
+ * typer.lo 0).  So neither affinity nor processor-number nor the
+ * Last bit can tell the frames apart.  The frames are nonetheless
+ * mapped one-per-cpu, in cpu order, at a fixed GICRFRAME stride,
+ * with the region terminated by unmapped all-ones GIC space (the
+ * frame just past the last cpu reads 0xffffffff).
+ *
+ * Therefore getrregs walks the redistributor region in GICRFRAME
+ * steps and, when affinity matching turns up nothing (the VZ
+ * case), falls back to positional indexing: cpu N gets the Nth
+ * mapped frame.  That is exactly how GICv3 lays consecutive
+ * redistributors out and matches the observed VZ layout
+ * (frame0=cpu0, frame1=cpu1, frame2 unmapped).
+ *
+ * getrregs is only ever called for the currently-running cpu (both
+ * intrinit and the PPI/SGI path of intrenable run on the cpu being
+ * set up), so the positional index is just this cpu's machno.
+ *
+ * The walk is bounded by the redistributor region the device tree
+ * advertises (gicrbase/gicrsize) when available, falling back to
+ * the compiled-in PHYSIO offset otherwise, so it can never run off
+ * the end of the mapped device window.
+ */
+enum {
+	GICRFRAME = 0x20000,	/* one RD+SGI pair (smallest redistributor) */
+};
+
+/*
+ * Debug aid: walk the whole advertised redistributor region and
+ * print one line per frame so we can see exactly what layout VZ
+ * presents (frame offset, the GICR_TYPER affinity word, the low
+ * TYPER word with its Last/VLPIS bits, and whether the frame reads
+ * back as all-ones unmapped GIC space).  Bounded by the same region
+ * getrregs() uses.  Called once from cpu0's intrinit, and again
+ * from getrregs() just before it panics, so a failed secondary
+ * bringup leaves a full map in the log.
+ */
+static void
+rregsbase(u32int **basep, uintptr *limp)
+{
+	if(gicrsize != 0 && gicrbase >= PHYSIO){
+		*basep = (u32int*)(VIRTIO + (gicrbase - PHYSIO));
+		*limp = gicrsize;
+	} else {
+		*basep = (u32int*)(VIRTIO + 0x10000);
+		*limp = PHYSIOEND - (PHYSIO + 0x10000);
+	}
+}
+
+void
+dumprregs(void)
+{
+	u32int *rregs, *base;
+	u32int lo, aff;
+	uintptr off, lim;
+	int n;
+
+	rregsbase(&base, &lim);
+	iprint("dumprregs: cpu%d mpidr %#llux want-aff %#ux base %#p lim %#p"
+		" (gicrbase %#llux gicrsize %#llux)\n",
+		m->machno, sysrd(MPIDR_EL1), mpidraff(sysrd(MPIDR_EL1)),
+		base, (void*)lim, gicrbase, gicrsize);
+	n = 0;
+	for(off = 0; off + GICRFRAME <= lim; off += GICRFRAME){
+		rregs = (u32int*)((uintptr)base + off);
+		lo = rregs[GICR_TYPER];
+		aff = rregs[GICR_TYPER + 1];
+		iprint("  frame %2d off %#p aff %#ux typer.lo %#ux%s%s%s\n",
+			n, (void*)off, aff, lo,
+			(lo & (1<<4)) ? " Last" : "",
+			(lo & (1<<0)) ? " PLPIS" : "",
+			(lo & (1<<1)) ? " VLPIS" : "");
+		n++;
+		if(lo == ~0u && aff == ~0u){
+			iprint("  ... frame reads all-ones (unmapped); stopping\n");
+			break;
+		}
+		if(lo & (1<<4))			/* Last */
+			break;
+	}
+}
+
 static u32int*
 getrregs(int machno)
 {
-	u32int *rregs = (u32int*)(VIRTIO + 0x10000);
+	u32int *rregs, *base;
+	u32int want, aff, typer;
+	uintptr off, lim;
+	int nframes;
 
-	for(;;){
-		if((rregs[GICR_TYPER] & 0xFFFF00) == (machno << 8))
-			return rregs;
-		if(rregs[GICR_TYPER] & (1<<4))
+	/*
+	 * Prefer the DTB-advertised redistributor region; fall
+	 * back to the compiled-in PHYSIO offset if the device tree
+	 * did not give us one.  Either way the region must lie in
+	 * the mapped device window [PHYSIO, PHYSIOEND).
+	 */
+	rregsbase(&base, &lim);
+
+	/*
+	 * First try to match by MPIDR affinity, the architecturally
+	 * correct discriminator (GICR_TYPER[63:32]).  This is what
+	 * works on real GICv3 and is kept as the preferred path.
+	 *
+	 * Under Apple VZ, however, the redistributor TYPER affinity
+	 * word reads back as 0 for *every* frame (see dumprregs:
+	 * cpu0 and cpu1 both report aff 0, typer.lo 0).  The frames
+	 * are nonetheless laid out one-per-cpu in cpu order at a
+	 * fixed GICRFRAME stride, terminated by unmapped all-ones
+	 * GIC space.  So if affinity matching fails we fall back to
+	 * indexing the Nth mapped frame for cpu N -- which is also
+	 * how the GICv3 architecture lays consecutive redistributors
+	 * out, and matches the observed VZ layout (frame0=cpu0,
+	 * frame1=cpu1, frame2 unmapped).
+	 */
+	want = mpidraff(sysrd(MPIDR_EL1));
+	aff = typer = 0;
+	nframes = 0;
+	for(off = 0; off + GICRFRAME <= lim; off += GICRFRAME){
+		rregs = (u32int*)((uintptr)base + off);
+		typer = rregs[GICR_TYPER];
+		aff = rregs[GICR_TYPER + 1];
+		if(typer == ~0u && aff == ~0u)	/* unmapped GIC space */
 			break;
-		rregs += (0x20000/4);
+		if(aff != 0 && aff == want)	/* real affinity match */
+			return rregs;
+		nframes++;
+		if(typer & (1<<4))		/* Last */
+			break;
 	}
-	panic("getrregs: no re-distributor for cpu %d\n", machno);
+
+	/*
+	 * Affinity match failed (VZ zeroes the field).  Fall back to
+	 * positional indexing: cpu N uses the Nth redistributor.
+	 *
+	 * The per-cpu redistributor size (stride) is GICRFRAME unless
+	 * the device tree advertised a redistributor region whose size
+	 * divides evenly by the cpu count -- in which case that quotient
+	 * is the authoritative stride (it accounts for GICv4/VLPI
+	 * layouts where each cpu's redistributor is 0x40000, not
+	 * 0x20000).  This is the guest-visible equivalent of Apple's
+	 * hv_gic_get_redistributor_size(): total region / ncpu.
+	 */
+	{
+		uintptr stride = GICRFRAME;
+
+		if(gicrsize != 0 && conf.nmach > 0){
+			uintptr s = (uintptr)(gicrsize / conf.nmach);
+			if(s >= GICRFRAME && (s % GICRFRAME) == 0)
+				stride = s;
+		}
+		off = (uintptr)machno * stride;
+		if(machno >= 0 && off + GICRFRAME <= lim){
+			rregs = (u32int*)((uintptr)base + off);
+			typer = rregs[GICR_TYPER];
+			aff = rregs[GICR_TYPER + 1];
+			if(!(typer == ~0u && aff == ~0u))
+				return rregs;
+		}
+	}
+
+	iprint("getrregs cpu%d want %#ux: %d mapped frames, last aff %#ux typer %#ux\n",
+		machno, want, nframes, aff, typer);
+	dumprregs();
+	panic("getrregs: no re-distributor for cpu %d (aff %#ux)\n", machno, want);
 }
 
 void
@@ -160,9 +334,33 @@ intrinit(void)
 		while(dregs[GICD_CTLR]&(1<<31))
 			;
 		dregs[GICD_CTLR] = (1<<0) | (1<<1) | (1<<4);
+
+		/*
+		 * One-time map of the redistributor layout VZ presents.
+		 * Quiet by default now that SMP works; set *gicdebug in
+		 * the kernel config to print it (and the per-frame walk)
+		 * for the next bring-up that needs it.
+		 */
+		if(getconf("*gicdebug") != nil)
+			dumprregs();
 	}
 
 	rregs = getrregs(m->machno);
+
+	/*
+	 * Wake this cpu's redistributor before touching its SGI/PPI
+	 * frame.  A secondary brought up by PSCI CPU_ON comes out of
+	 * reset with GICR_WAKER.ProcessorSleep set; until it is
+	 * cleared (and ChildrenAsleep observed low) the redistributor
+	 * ignores SGI/PPI configuration.  cpu0 is already awake, so
+	 * this is a harmless no-op there.  WAKER bits: ProcessorSleep
+	 * = bit 1, ChildrenAsleep = bit 2.
+	 */
+	rregs[GICR_WAKER] &= ~(1<<1);
+	coherence();
+	while(rregs[GICR_WAKER] & (1<<2))
+		;
+
 	n = 32;
 	for(i = 0; i < n; i += 32){
 		rregs[GICR_IGROUPR0 + (i/32)] = -1;

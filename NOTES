@@ -4,6 +4,57 @@ vz64 kernel bringup notes
 Platform: 9front kernel running as guest under Apple Virtualization.framework
 Guest starts at EL1 (hypervisor at EL2).  Host-side runner: 9vz (mac).
 
+SMP: DONE -- 2-cpu boot verified
+--------------------------------
+A 2-cpu guest (9vz default -cpus 2, *ncpu unset) boots cleanly to
+the interactive rc prompt with cpu1 online.  cpu0 brings cpu1 up
+via PSCI CPU_ON (SMC64 0xC4000003); cpu1 runs the secondary path
+(trapinit/fpuinit/intrinit/clockinit/synccycles/timersinit/
+mmu1init/schedinit) and joins the scheduler.  The whole bug chain
+that got us here (Bugs 1-7g below) is preserved as the historical
+record; the decisive ones for SMP were:
+  - PSCI CPU_ON needs the SMC64 id (Bug 7g block / mpinit).
+  - getrregs cannot match by GICR_TYPER affinity under VZ (TYPER
+    reads all-zero); it falls back to POSITIONAL indexing, cpu N
+    = Nth 0x20000 redistributor frame, bounded by the DTB region
+    (Bug 7g, gic.c).
+  - GICR_WAKER must be cleared on the secondary before its SGI/PPI
+    frame responds (Bug 7c, intrinit).
+  - main.c BSS clear gated on cpu0; uartvz TX serialised with the
+    vcon.txl ilock so two cpus printing do not corrupt the vring.
+
+Apple Virtualization CPU count: NOT limited to two.  We tested 2
+because 9vz defaults to -cpus 2 and that was the next unverified
+step; the count comes from VZVirtualMachineConfiguration.cpuCount,
+whose ceiling is min(host performance-core count, a framework max)
+-- reported by VZVirtualMachineConfiguration.maximumAllowedCPUCount
+at runtime (typically the number of physical cores on the host).
+Our path has no 2-cpu assumption: conf.nmach comes from the DTB
+cpu nodes / *ncpu, the redistributor walk and cpumpid[] are sized
+by MAXMACH, and getrregs indexes by machno.  To try more cpus:
+launch 9vz with -cpus N (N <= maximumAllowedCPUCount) and leave
+*ncpu unset.  If a higher count misbehaves, set *gicdebug and
+*smpdebug (below) and read the per-cpu redistributor map +
+heartbeat.
+
+SMP diagnostics (now gated, quiet by default)
+---------------------------------------------
+The bring-up instrumentation is kept but silenced so a normal boot
+is clean.  Re-enable from the kernel config / cmdline:
+  *gicdebug   gic.c   dumprregs() the redistributor map in cpu0
+                      intrinit; bootargs.c prints the captured GIC
+                      node + gicd/gicr base/size + per-cpu stride.
+  *smpdebug   main.c  mpinit prints each PSCI CPU_ON target, and
+                      the secondary prints a per-stage heartbeat
+                      ("cpuN main: <stage>") so a silent wedge names
+                      the stage that hung.
+dumprregs() is also still called automatically right before the
+getrregs panic, and synccycles() still announces a stuck barrier
+("synccycles: cpuN stuck ... have M of K"), regardless of the
+switches -- those only fire on failure.  cpuidprint() still prints
+"cpuN: Apple Virtualization.framework" per cpu, so a healthy boot
+confirms every secondary online without any debug switch.
+
 Build / image workflow
 ----------------------
 The linker output 9vz goes through aux/aout2uimage producing 9vz.u
@@ -176,9 +227,12 @@ virtio-gpu.
 Next projects, roughly in order:
   - networking smoke test (ip/ipconfig over virtio-net NAT)
   - service=cpu + auth + drawterm from the mac
-  - SMP bring-up (remove *ncpu=1, then -cpus N)
+  - SMP bring-up (remove *ncpu=1, then -cpus N)   [DONE -- see
+    "SMP: DONE" milestone at the top of this file]
   - virtio-gpu + devdraw/devmouse for native graphics
   - console quirks: putc/kick vring race, rx-during-flush
+    [the putc/kick TX race is fixed: vcon.txl ilock now wraps
+    both putc and kick in uartvz.c]
 
 CPU server + drawterm recipe
 ----------------------------
@@ -255,10 +309,117 @@ FIX APPLIED in mpinit (0xC4000003), UNTESTED.  Boot once without
 *ncpu=1 when convenient; the failure print makes the outcome
 unambiguous either way.  Single-cpu boots are unaffected (mpinit
 loop body never runs with conf.nmach == 1).
-KNOWN RISK: uartvz TX path has no lock; concurrent prints from
-two cpus can race the vring (garbled console).  If seen, the fix
-is an ilock around txpost/txwait in putc/kick -- already on the
-TODO list, not a mystery.
+Bug 7: getrregs matched redistributor by processor number (FIX APPLIED)
+-----------------------------------------------------------------------
+With PSCI CPU_ON fixed to the SMC64 id 0xC4000003, cpu1 now
+actually starts and runs far enough to call intrinit ->
+getrregs(1), where it panicked:
+    panic: getrregs: no re-distributor for cpu 1
+getrregs walked the GICv3 redistributor frames and matched
+GICR_TYPER[23:8] (the "Processor_Number" field) against machno.
+That happened to work for cpu0 but Apple VZ does not number the
+redistributors 0..N to match our machno, so cpu1's search ran off
+the Last redistributor and panicked.
+
+Fix in gic.c: match by MPIDR affinity instead.  GICv3 identifies a
+redistributor by the affinity value in GICR_TYPER[63:32] (the high
+32-bit word, read as rregs[GICR_TYPER+1]).  getrregs is only ever
+called for the currently-running cpu, so it now compares against
+mpidraff(sysrd(MPIDR_EL1)) -- this cpu's own MPIDR packed into the
+GIC's Aff3<<24|Aff2<<16|Aff1<<8|Aff0 layout.  No dependence on DTB
+cpu-node ordering.  Redistributor stride stays 0x20000 (RD+SGI,
+two 64KB frames; cpu0 worked with it so VLPIs are off).  UNTESTED
+on hardware -- boot without *ncpu=1 to confirm cpu1 passes
+intrinit; next candidates if it hangs are clockinit/timersinit on
+the secondary and the unlocked uartvz TX race below.
+
+Bug 7b: redistributor stride wrong under GICv4/VLPI (FIX APPLIED)
+-----------------------------------------------------------------
+With Bug 7's affinity-match fix in place, cpu1 still panicked:
+    panic: getrregs: no re-distributor for cpu 1 (aff 0x1)
+The new panic message format (showing "aff 0x1") confirms the
+affinity-match code is the one running, and that cpu1's own MPIDR
+read returns aff0 = 1 (so Apple DOES put the cpu index in aff0,
+and cpumpid[]/mpinit are targeting the right cpu -- cpu1 truly
+starts and reaches intrinit).
+
+So the affinity packing is right but the redistributor SCAN never
+finds a frame whose GICR_TYPER[63:32] == 1.  Prime suspect: the
+walk stride.  GICv3 redistributors are 2x 64KB frames (RD+SGI =
+0x20000), but a GICv4 implementation that supports virtual LPIs
+has 4 frames per redistributor (0x40000): the extra VLPI/reserved
+frames.  GICR_TYPER.VLPIS (bit 1) advertises this.  If Apple VZ's
+GIC reports VLPIS, cpu0's redistributor occupies 0..0x40000 and
+cpu1's starts at 0x40000; stepping by a hardcoded 0x20000 lands on
+cpu0's VLPI frame, whose affinity is still cpu0's (or 0), so the
+match fails and we eventually hit Last and panic.
+
+FIX in gic.c getrregs: read GICR_TYPER.VLPIS and step by 0x40000
+when set, else 0x20000.  Added an iprint of the last frame's
+aff/typer before the panic so the next failure (if any) is
+diagnosable: it tells us the real stride, whether Last fired
+early, and what affinities the frames actually carry.  UNTESTED --
+boot without *ncpu=1.  If it still panics, read the iprint: if the
+"last frame typer" shows VLPIS=0 then the stride theory is wrong
+and the issue is elsewhere (only one redistributor exposed? GICR
+window too small? affinity packed differently by Apple?).
+
+Bug 7d: redistributor walk overshot into all-ones GIC space (FIX APPLIED)
+-------------------------------------------------------------------------
+Bug 7b's VLPI-aware stride still panicked, and the diagnostic
+iprint told the real story:
+    getrregs cpu1 want 0x1: last frame aff 0xffffffff typer 0xffffffff
+typer 0xffffffff is not a valid GICR_TYPER -- it is the all-ones
+read of an UNMAPPED-but-decoded GIC address (a GICR offset with no
+register behind it).  So the walk stepped PAST cpu1's redistributor
+into dead GIC space; 0xffffffff happens to have bit 4 (Last) set,
+so the loop terminated and panicked.  Conclusion: the VLPIS=>0x40000
+stride guess was wrong for VZ.  cpu0's TYPER reads VLPIS set, but
+VZ still spaces the redistributors 0x20000 apart, so 0x40000
+overshoots.
+
+Two-part fix:
+  1. gic.c getrregs: stop guessing the stride.  Walk every 0x20000
+     frame (the smallest possible RD+SGI redistributor) and match
+     GICR_TYPER[63:32] affinity.  In a GICv4/VLPI layout the extra
+     0x20000 sub-frames simply do not carry the target affinity, so
+     stepping over them is harmless; in GICv3 each 0x20000 step
+     lands exactly on an RD_base.  No VLPIS branch at all.
+  2. bound the walk to the redistributor region the DEVICE TREE
+     advertises (the arm,gic-v3 node's `reg`, region 1), so an
+     unlucky stride can never run off into all-ones space again.
+     bootargs.c now parses the intc node reg into gicdbase/gicdsize
+     and gicrbase/gicrsize (handles both 2/2 and 1/1 address/size
+     cell layouts; VZ uses 2/2); getrregs prefers gicrbase/gicrsize
+     and falls back to the compiled-in PHYSIO+0x10000 offset if the
+     DTB lacked them.
+The GICR_TYPER.Last bit still ends the walk early when present.
+UNTESTED on hardware -- boot without *ncpu=1 to confirm cpu1 now
+passes getrregs.  If the iprint reappears with a SANE typer (not
+all-ones) and aff != want for every frame, then VZ packs the
+redistributor affinity differently from MPIDR and mpidraff() needs
+revisiting; if gicrsize came back 0, the intc node name/reg layout
+differs from the assumed "intc"/"interrupt-controller" + 2/2 cells.
+
+Bug 7c: secondary redistributor left asleep (FIX APPLIED, pre-emptive)
+-----------------------------------------------------------------------
+While in getrregs anyway, added the GICR_WAKER wakeup that the
+GICv3 spec requires before using a redistributor's SGI/PPI frame.
+A cpu brought up by PSCI CPU_ON comes out of reset with
+GICR_WAKER.ProcessorSleep (bit 1) set; until software clears it
+and observes ChildrenAsleep (bit 2) go low, the redistributor
+ignores SGI/PPI config (our PPI enables for the virtual timer
+would silently do nothing -> no clock interrupts on cpu1 ->
+secondary wedged in timersinit/schedinit).  cpu0 is already awake
+so the clear is a no-op there.  Done in intrinit right after
+getrregs, before the SGI_base register writes.  This was a latent
+problem the affinity panic was hiding; fixing it now avoids a
+second round-trip once the stride fix gets cpu1 past getrregs.
+
+KNOWN RISK (NOW FIXED): uartvz TX path had no lock; concurrent
+prints from two cpus could race the vring (garbled console).  Fixed
+with the vcon.txl ilock around txwait/txpost in both putc and kick
+(uartvz.c).  Verified clean on the 2-cpu boot -- no garbling.
 
 Root filesystem facts:
   - sdvirtio10 viopnp letters virtio-blk disks from 'F': the
@@ -272,12 +433,35 @@ Root filesystem facts:
   - the root image must contain an arm64 userland (/arm64/bin,
     /arm64/init); an amd64-only install image will mount and
     then fail to exec init.
-  - keep *ncpu=1 in cmdline until SMP bring-up is its own
-    project (mpinit/PSCI CPU_ON plumbing exists but untested;
-    the embedded header's code0 is executable so secondaries
-    entering at _start are safe).
+  - SMP works now: *ncpu may be left unset (defaults to the DTB
+    cpu count) and 9vz -cpus N >= 2 boots cleanly.  *ncpu=1 still
+    works to force a single-cpu boot if you want to take secondary
+    bring-up out of the picture while debugging something else.
 
 See PORT.txt for the full write-up of the port.
+
+STATUS (SMP): RESOLVED -- see "SMP: DONE" at the top.  2-cpu boot
+reaches the rc prompt with cpu1 online.  The fix set below (7g +
+7c) is the one that worked; left here for the reasoning trail.
+
+cpu1 starts (PSCI CPU_ON SMC64), reaches intrinit.
+A real boot (7e/7f tracing) showed the redistributor TYPER reads
+ALL-ZERO on VZ, so affinity matching (7/7b/7d) is impossible -- see
+Bug 7g for the full diagnosis.  Fix set that landed it:
+  (7g) getrregs: affinity match kept but guarded (aff!=0), with a
+       POSITIONAL fallback -- cpu N uses the Nth redistributor
+       frame, stride GICRFRAME (0x20000) or gicrsize/conf.nmach
+       when the DTB gives a region.  Verifies the frame is mapped.
+  (7g) bootargs.c: GIC node matched by `compatible` containing
+       "gic-v3" (not by node name), so gicrbase/gicrsize finally
+       populate; bootargsinit() prints the captured layout.
+  (7c) intrinit clears GICR_WAKER.ProcessorSleep and waits for
+       ChildrenAsleep before touching the SGI/PPI frame.
+NEXT TEST: boot without *ncpu=1 (9vz default -cpus 2).  Read the
+new "bootargsinit: gic node ..." line FIRST (did the DTB parse
+work? what is the real gicr size / per-cpu stride?), then the cpu0
+dumprregs map, then the 7f heartbeat lines / synccycles barrier
+message.  Full read-the-output guide in the Bug 7g and 7e blocks.
 
 STATUS: probe removed entirely; full boot attempt.  Remaining
 stretch: chandevreset, userinit, mpinit, mmu1init, schedinit ->
@@ -320,12 +504,267 @@ Debugging tools:
     uartvz putc only fills a memory ring buffer before that, so
     early print() is invisible.  vzstop is the only early signal.
 
-Known boot sequence status:
+Known boot sequence status (SUPERSEDED -- see Bug 6 milestone):
+  Single-cpu (*ncpu=1) boots ALL THE WAY to the interactive rc
+  prompt (Bug 6).  The whole cpu0 path -- _start through schedinit,
+  init0, touser, /boot -- is VERIFIED working.  This stale list is
+  kept only for the historical bisection record.
   works: _start, svcmode, mmuenable, machinit, uartconsinit,
          quotefmtinstall, bootargsinit (DTB parse OK)
-  fix applied, verifying: meminit
-  untested beyond: confinit, xinit, printinit, print, trapinit,
-         fpuinit, intrinit, clockinit, timersinit, pageinit, ...
+  (historical) was: "fix applied, verifying: meminit; untested
+         beyond: confinit, xinit, printinit, print, trapinit,
+         fpuinit, intrinit, clockinit, timersinit, pageinit, ..."
+         -- all of these now pass on cpu0.
+
+  CURRENT FRONTIER is SMP (cpu1).  cpu1 path so far:
+         _start (OK, executable header code0) -> machinit (OK) ->
+         trapinit/fpuinit (OK, 7f heartbeat) -> intrinit -> getrregs
+         (was the panic; Bug 7g positional-fallback fix UNTESTED) ->
+         clockinit -> cpuidprint -> synccycles -> timersinit ->
+         mmu1init -> schedinit.  Everything from getrregs onward on
+         the SECONDARY is unverified -- see the SMP STATUS block
+         above and Bug 7g for the exact next test and failure
+         branches.  Confirmed by a real boot: cpu1 DOES start and
+         reach intrinit (the getrregs panic printed "aff 0x1" from
+         cpu1's own MPIDR), so PSCI CPU_ON / mpinit / cpumpid are
+         all correct; the only remaining cpu1 blocker proven so far
+         was getrregs, which 7g addresses.
+
+Bug 7e: instrumentation added for the next SMP iteration (THIS SESSION)
+-----------------------------------------------------------------------
+Bug 7d's fix (0x20000 affinity scan bounded by gicrbase/gicrsize)
+was applied but NOT yet retested; the session had to be killed
+before a boot.  Rather than guess at yet another stride/affinity
+theory blind, this session added DIAGNOSTIC TRACING so the next
+boot prints the actual GIC layout VZ presents.  No behavioural
+change for single-cpu boots.
+
+What was added (all compiles clean, `mk` in /sys/src/9/vz64):
+  1. gic.c dumprregs(): walks the whole advertised redistributor
+     region and prints, per 0x20000 frame:
+         frame N  off <off>  aff <GICR_TYPER[63:32]>
+                  typer.lo <low word>  [Last] [PLPIS] [VLPIS]
+     plus a header line with m->machno, raw MPIDR_EL1, the packed
+     want-affinity, base, lim, and gicrbase/gicrsize.  Stops on an
+     all-ones (unmapped) frame or the Last bit.  Declared in fns.h.
+     A shared rregsbase() helper now computes base/lim for both
+     dumprregs() and getrregs() (single source of truth).
+  2. gic.c intrinit(): calls dumprregs() ONCE on cpu0 (machno==0),
+     right after the distributor is enabled -- a known-good state,
+     printed before any secondary starts.  This is the reference
+     map.
+  3. gic.c getrregs(): now also breaks the walk explicitly on an
+     all-ones frame, and calls dumprregs() right before the panic,
+     so a failed cpu1 bringup leaves the same map from cpu1's view
+     in the log next to the panic.
+  4. main.c mpinit(): prints per secondary, before the hvccall:
+         mpinit: CPU_ON cpuN mpid <X> (dtb cpumpid[N] <Y>
+                 ncpumpid <Z>) entry <PADDR(_start)>
+     so you can correlate the cpu you ASKED VZ to start against the
+     affinity that actually shows up in the redistributor map.
+
+HOW TO READ THE NEXT BOOT (boot without *ncpu=1, 9vz default
+-cpus 2):
+  A. Find the cpu0 "dumprregs:" block (printed during cpu0
+     intrinit, BEFORE any "mpinit:" line).  This is the truth about
+     VZ's redistributor layout while only cpu0 is online.
+       - If it lists MULTIPLE frames with distinct aff values, one
+         of them should have aff == the mpid mpinit targets for
+         cpu1.  If so, getrregs SHOULD now find it -> likely a clean
+         pass; watch downstream (clockinit/timersinit/schedinit on
+         cpu1, and the unlocked uartvz TX race -> garbled console,
+         ilock fix still on TODO).
+       - If it lists only ONE frame ending in Last (aff 0 only),
+         VZ presents offline cpus' redistributors as ABSENT until
+         PSCI CPU_ON wakes them.  Then cpu1's frame should appear
+         only AFTER mpinit; the bug is visibility/ordering, and the
+         per-cpu dumprregs() from getrregs (on cpu1, after CPU_ON)
+         is the one to read -- if cpu1's own dump now shows its
+         frame, the cpu0 reference simply couldn't see it yet.
+       - If gicrsize prints as 0 in the header, the DTB intc-node
+         parse failed: the node name or reg cell layout differs
+         from the assumed "intc"/"interrupt-controller" + 2/2
+         address/size cells.  Fix bootargs.c devtreeprop().
+  B. Compare the "mpinit: CPU_ON cpu1 mpid X (dtb cpumpid[1] Y...)"
+     line against the affinities in the dump.
+       - If mpid X does NOT equal any frame's aff, and cpu1 still
+         comes up reporting MPIDR aff 0x1 (the want in the panic),
+         then mpinit targeted the wrong cpu OR mpidraff() packs
+         differently than the GIC reports affinity.  Cross-check
+         dtb cpumpid[1] (Y) against the running aff: if Y != the
+         aff cpu1 reports, the DTB cpu-node order disagrees with
+         hardware MPIDRs.
+       - If mpid X DOES match a frame aff but getrregs on cpu1 still
+         misses, the mismatch is in how cpu1's OWN MPIDR packs vs
+         how the frame stores it -- revisit mpidraff() (Aff3 shift).
+  C. The getrregs panic's own "last frame aff .. typer .." line:
+       - typer all-ones (0xffffffff) again => still overshooting
+         into dead space; gicrsize bound did not stop it (region
+         smaller than expected, or base wrong).
+       - typer SANE but no aff matched => affinity packing problem
+         (B above), not a stride problem.
+
+DONE (SMP works): the noisy diagnostics are now gated, not deleted.
+The dumprregs() call in cpu0 intrinit and the bootargs GIC-layout
+print are behind *gicdebug; the mpinit per-cpu print and the
+secondary per-stage heartbeat are behind *smpdebug.  dumprregs()
+itself is kept (still auto-called right before the getrregs panic).
+See the "SMP diagnostics" block at the top of this file.
+
+Bug 7g: affinity match is IMPOSSIBLE under VZ -- TYPER reads all-zero (FIX APPLIED)
+-----------------------------------------------------------------------------------
+THE DIAGNOSTIC TRACING FROM 7e/7f PAID OFF.  A real boot without
+*ncpu=1 produced the actual redistributor map and the panic, and
+they settle the question the 7/7b/7d theories kept circling:
+
+    dumprregs: cpu0 mpidr 0x80000000 want-aff 0x0
+        base 0xffffffff10010000 lim 0x10060000
+        (gicrbase 0x0 gicrsize 0x0)
+      frame  0 off 0x0      aff 0x0        typer.lo 0x0
+      frame  1 off 0x20000  aff 0x0        typer.lo 0x0
+      frame  2 off 0x40000  aff 0xffffffff typer.lo 0xffffffff Last PLPIS VLPIS
+      ... frame reads all-ones (unmapped); stopping
+    ...
+    getrregs cpu1 want 0x1: last frame aff 0xffffffff typer 0xffffffff
+    panic: getrregs: no re-distributor for cpu 1 (aff 0x1)
+
+Read it carefully -- THREE facts, all decisive:
+
+  (a) Both frame 0 AND frame 1 report aff 0x0, typer.lo 0x0.  A
+      real GICR_TYPER mirrors MPIDR affinity in [63:32] and carries
+      Processor_Number/Last/VLPIS in the low word; ALL of those read
+      back as ZERO here.  So affinity matching (Bug 7) can NEVER
+      distinguish cpu1 -- nothing in the GIC reports aff 1.  cpu0
+      "worked" only because want==0 accidentally equals the zeroed
+      field.  Matching by Processor_Number (the original code) and
+      matching by Last (7b/7d) are equally dead: both fields are 0.
+
+  (b) The two MAPPED frames are at 0x0 and 0x20000; 0x40000 reads
+      all-ones (unmapped).  So the layout is exactly 2 cpus x
+      0x20000 stride = a 0x40000 region.  frame0=cpu0, frame1=cpu1,
+      positionally, in cpu order.  (Note frame2's all-ones happens
+      to set bits that DECODE as Last+PLPIS+VLPIS -- a red herring
+      that fed the 7b VLPI-stride theory.  It is just 0xffffffff.)
+
+  (c) gicrbase 0x0 gicrsize 0x0 -- the DTB intc-node parse FAILED,
+      so 7d's "bound the walk by the DTB region" never engaged and
+      the walk used the compiled-in fallback.  The node name did
+      not match "/intc" or "/interrupt-controller".
+
+Two-part fix this session:
+
+  1. gic.c getrregs: keep affinity match as the PREFERRED path
+     (real hw / qemu), but require aff != 0 for it to count (so the
+     all-zero VZ field never false-matches cpu0), and add a
+     POSITIONAL FALLBACK: cpu N uses the Nth redistributor frame.
+     getrregs is only ever called for the running cpu, so the index
+     is just machno.  Stride is GICRFRAME (0x20000) unless the DTB
+     gave a gicrsize that divides evenly by conf.nmach, in which
+     case gicrsize/nmach is the authoritative per-cpu stride (the
+     guest-visible analogue of Apple's
+     hv_gic_get_redistributor_size: total region / ncpu -- this is
+     what disambiguates a plain-GICv3 0x20000 from a GICv4/VLPI
+     0x40000 layout WITHOUT guessing from VLPIS, which 7d proved
+     unreliable).  The fallback verifies the chosen frame is mapped
+     (not all-ones) before returning it.
+
+  2. bootargs.c: fix the GIC-node match so gicrbase/gicrsize
+     actually get populated.  Stop trusting the node NAME; latch
+     onto the node whose `compatible` property contains "gic-v3"
+     (memhas() substring scan over the NUL-separated list), record
+     its path, and capture that node's `reg`.  Name heuristics
+     (/intc, /interrupt-controller, /gic) remain only as a fallback
+     when no compatible match was seen.  bootargsinit() now PRINTS
+     the captured gic node path, gicd/gicr base+size, and the
+     derived per-cpu stride, so the next boot says outright whether
+     the DTB parse finally worked and what the real region size is.
+
+WHY THIS SHOULD WORK where 7/7b/7d did not: it stops trying to read
+identity out of a TYPER that VZ zeroes, and instead uses the one
+thing the dump PROVED is true -- redistributors are laid out one
+per cpu, in order, 0x20000 apart, terminated by unmapped space.
+
+VERIFIED -- 2-cpu boot (9vz default -cpus 2) reaches the rc prompt
+with cpu1 online.  cpu1 passes getrregs via the positional fallback
+(frame 1), does the 7c GICR_WAKER wake, and continues through
+clockinit/synccycles/timersinit/mmu1init/schedinit to the
+scheduler.  The "SMP: DONE" milestone at the top of this file is
+the authoritative status.
+
+Bug 7f: make the SECONDARY path and the BARRIER talk (THIS SESSION)
+-------------------------------------------------------------------
+Observation that drove this: we were "posting literally everything
+from the console" and STILL guessing, because the secondary cpu's
+path is silent by construction and the cross-cpu barrier hangs
+mutely.  Two specific blind spots, both now scribbled over:
+
+(1) main.c secondary heartbeat.  The `if(m->machno)` block in
+    main() ran trapinit/fpuinit/intrinit/clockinit/synccycles/
+    timersinit/mmu1init/schedinit with NO output.  If cpu1 wedges
+    or faults in any of them, the console shows nothing past
+    whatever cpu0 last printed.  With *smpdebug set each stage now
+    prints
+        cpuN main: <stage>
+    BEFORE running it, so the LAST such line names the stage that
+    hung.  (iprint = polling putc, does not need this cpu's clock
+    or scheduler.)  cpuidprint()'s "cpuN: Apple Virtualization.
+    framework" (always printed, no switch) is the success marker
+    that the secondary got past clockinit; reaching it on every
+    secondary means SMP is up.  (Gated behind *smpdebug now that
+    SMP works -- see the diagnostics block at the top.)
+
+(2) clock.c synccycles() barrier.  HISTORICAL SILENT-HANG TRAP:
+    synccycles is a spin barrier (every cpu waits until
+    r->ref == conf.nmach).  It is called by cpu0 at the END of
+    mpinit and by every secondary in main().  If ANY cpu dies
+    (panics/exits) before reaching its synccycles -- exactly what
+    the getrregs panic did, "cpu1: exiting" -- the survivors spin
+    here FOREVER with no output.  That is the canonical "SMP boot
+    just hangs with nothing on screen."  Fixed: the spins are now
+    in syncwait(), which after a huge spin count prints
+        synccycles: cpuN stuck at <enter|leave> barrier:
+                    have M of K cpus
+    then keeps waiting (and will reprint).  So a stuck barrier now
+    SAYS which cpu is stuck and how many it is missing: "have 1 of
+    2" from cpu0 means a secondary never arrived; from a secondary
+    it means cpu0 never released it.
+
+These are diagnosis aids, not fixes; they turn a mute hang into a
+labelled one.  Single-cpu boots: heartbeat block is m->machno-
+gated (never runs on cpu0), syncwait's threshold is never reached
+when conf.nmach==1 (r->ref hits 1 immediately).  No behaviour
+change for the working terminal/cpu boot.
+
+Panic-from-secondary note: panic/dumpstack use iprint -> putc desc
+0 (polling) under the uartvz txl ilock, and dumpstackwithureg
+delay(2000)s after the ktrace line, so a secondary's last words DO
+drain before it exits -- we saw this work already (the original
+getrregs panic text arrived intact).  If a future secondary panic
+produces TRUNCATED output, suspect the txl ilock contending with
+cpu0 or the virtio backend stalling during teardown; *nodumpstack
+(getconf) skips the stack walk to shorten the window.
+
+WHAT A HEALTHY SMP BOOT LOOKS LIKE with *gicdebug AND *smpdebug set
+(without them, only the "cpu1: Apple Virtualization.framework" line
+appears -- the rest is silenced; see the "SMP diagnostics" block at
+the top):
+    ... cpu0 boot through chandevreset ...
+    dumprregs: cpu0 ... (the redistributor map)
+      frame ...
+    ... mpinit: CPU_ON cpu1 mpid ... ...
+    cpu1 main: trapinit
+    cpu1 main: fpuinit
+    cpu1 main: intrinit
+    (cpu1's own dumprregs only appears here if getrregs PANICS)
+    cpu1 main: clockinit
+    cpu1: Apple Virtualization.framework
+    cpu1 main: synccycles
+    cpu1 main: timersinit
+    cpu1 main: mmu1init
+    (cpu1 then enters schedinit and joins the scheduler)
+Anything missing from the tail of that list = the next thing to
+look at.  A "synccycles: cpuN stuck ... have M of K" line = a cpu
+died before the barrier; read upward for its last heartbeat/panic.
 
 Changes to files OUTSIDE vz64: REVERTED.
   - /sys/src/9/port/print.c restored to stock (fmtlclear/fmtlwhere

@@ -106,6 +106,42 @@ delay(int n)
 		microdelay(1000);
 }
 
+/*
+ * Barrier across all cpus.  Called by cpu0 at the end of mpinit
+ * and by every secondary as it comes up.  HISTORICAL TRAP: if any
+ * cpu dies (panics/exits) before reaching its synccycles, the
+ * survivors spin here forever with NO console output -- the
+ * classic "SMP boot just hangs" with nothing to show for it.
+ *
+ * To make that visible, the spins are bounded by a loop count and,
+ * if a cpu waits too long, it announces which barrier it is stuck
+ * on and how many cpus it is still waiting for (so you can tell
+ * "cpu1 never arrived" from "cpu0 never released us").  CNTVCT_EL0
+ * is up by the time synccycles runs (clockinit ran first on both
+ * paths), so we could time it, but a raw spin count needs no timer
+ * and works even if the virtual counter is misbehaving.  The
+ * threshold is deliberately huge; a healthy barrier closes in
+ * microseconds, so reaching it always means something is wrong.
+ */
+static void
+syncwait(Ref *r, char *which)
+{
+	uvlong i;
+	int complained;
+
+	complained = 0;
+	for(i = 0; r->ref != conf.nmach; i++){
+		if(i >= 2000000000ULL && !complained){
+			iprint("synccycles: cpu%d stuck at %s barrier:"
+				" have %ld of %ld cpus\n",
+				m->machno, which, r->ref, conf.nmach);
+			complained = 1;
+			i = 0;
+		}
+		coherence();
+	}
+}
+
 void
 synccycles(void)
 {
@@ -115,12 +151,10 @@ synccycles(void)
 	s = splhi();
 	r2.ref = 0;
 	incref(&r1);
-	while(r1.ref != conf.nmach)
-		;
+	syncwait(&r1, "enter");
 //	syswr(PMCR_EL0, 1<<6 | 7);
 	incref(&r2);
-	while(r2.ref != conf.nmach)
-		;
+	syncwait(&r2, "leave");
 	r1.ref = 0;
 	splx(s);
 }

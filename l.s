@@ -45,9 +45,28 @@ TEXT _hdrend(SB), 1, $-4
 	BL	l2cacheuwbinv(SB)
 	BL	cacheiinv(SB)
 
-	MOV	$(MACHADDR(0)-KZERO), R27
-	MRS	MPIDR_EL1, R1
+	/*
+	 * Determine this cpu's machno.
+	 *
+	 * cpu0 is started by the boot loader with R0 = physical
+	 * address of the device tree blob (a RAM pointer, >= the
+	 * RAM base 0x70000000).  Secondaries are started by mpinit
+	 * via PSCI CPU_ON, which delivers the context_id in R0; we
+	 * pass the machno (1..MAXMACH-1) there.  So a small R0
+	 * (< MAXMACH) is a secondary's machno; anything larger is
+	 * cpu0's DTB pointer and machno = 0.
+	 *
+	 * This avoids relying on MPIDR aff0 == machno, which does
+	 * not hold under Apple VZ's affinity layout.
+	 */
+	MOV	R26, R1			/* R1 = saved R0 */
+	CMP	$MAXMACH, R1
+	BLO	_haveno			/* R0 < MAXMACH: it is our machno */
+	MOVWU	$0, R1			/* otherwise we are cpu0 */
+_haveno:
 	ANDW	$(MAXMACH-1), R1
+
+	MOV	$(MACHADDR(0)-KZERO), R27
 	MOVWU	$MACHSIZE, R2
 	MULW	R1, R2, R2
 	SUB	R2, R27
