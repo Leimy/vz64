@@ -58,10 +58,15 @@ confirms every secondary online without any debug switch.
 Build / image workflow
 ----------------------
 The linker output 9vz goes through aux/aout2uimage producing 9vz.u
-(64-byte uImage header + text + data).  On the mac side:
+(64-byte uImage header + text + data).  The mkfile then strips that
+header to produce 9vz.bin (target $p$CONF.bin -- the dd that used
+to be a manual mac-side step is now part of `mk`).  On the mac side
+just boot the .bin directly, no header tools:
 
-  dd if=9vz.u of=9vz.bin bs=64 skip=1     # strip uImage header
   ./9vz -kernel 9vz.bin ...               # boot it directly
+
+(Historically this was done by hand:
+  dd if=9vz.u of=9vz.bin bs=64 skip=1     # now done by the mkfile)
 
 l.s now embeds an ARM64 Linux-style boot header at _start:
   code0 = B _hdrend (jumps over the 64-byte header)

@@ -36,15 +36,23 @@ Boot your QEMU baseline 9front, get this directory to
     cd /sys/src/9/vz64
     mk 'CONF=vz'
 
-Produces `9vz` (Plan 9 a.out) and `9vz.u` (uImage via aout2uimage,
-load/entry 0x70100000).
+Produces `9vz` (Plan 9 a.out), `9vz.u` (uImage via aout2uimage,
+load/entry 0x70100000), and `9vz.bin` (the uImage with its 64-byte
+header stripped -- this is what the mac runner boots directly).
 
 ## Running under VZ (on the Mac)
 
-    dd if=9vz.u of=9vz.bin bs=64 skip=1        # strip uImage header
-    python3 mkarm64hdr.py 9vz.bin 9vz.img      # add arm64 Image header
-    ./9vz -kernel 9vz.img -disk 9front.raw \
+`9vz.bin` is built ready to boot: l.s embeds the ARM64 Linux-style
+boot header, so no header tool is needed on the mac side.  Just
+copy 9vz.bin over and:
+
+    ./9vz -kernel 9vz.bin -disk 9front.raw \
           -cmdline 'console=0'                  # bootargs = plan9.ini
+
+(The old two-step `dd if=9vz.u ... bs=64 skip=1` + `mkarm64hdr.py`
+flow is gone: the dd strip is now a build target, and the python
+header is superseded by the embedded header in l.s.  Do NOT run
+mkarm64hdr.py on 9vz.bin -- see NOTES.)
 
 ## Expectations, round 1
 

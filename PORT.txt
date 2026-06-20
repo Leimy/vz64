@@ -7,9 +7,12 @@ kernel that runs as a guest under Apple's Virtualization.framework
 protocol, the build process, every VZ-specific adaptation, and the
 debugging lessons learned during bring-up.
 
-Status at time of writing: BOOTS TO AN INTERACTIVE RC PROMPT.
-hjfs root mounts from virtio-blk (/dev/sdF0/fs), bootfs and
-factotum run, glenda logs in, init starts rc:
+Status at time of writing: BOOTS TO AN INTERACTIVE RC PROMPT,
+SMP-CAPABLE.  hjfs root mounts from virtio-blk (/dev/sdF0/fs),
+bootfs and factotum run, glenda logs in, init starts rc.  A
+multi-cpu guest (9vz default -cpus 2, *ncpu unset) boots cleanly
+with the secondary cpus online; *ncpu=1 still forces a single-cpu
+boot.
 
     Plan 9
     timer frequency 24000000 Hz
@@ -29,7 +32,10 @@ Known wrinkle: with service=terminal, termrc/profile try to bind
 bare rc.  Guard the profile, or boot service=cpu and use drawterm
 from the host for graphics.  Boot cmdline that works:
 
-    console=0 *ncpu=1 nobootprompt=local!/dev/sdF0/fs
+    console=0 nobootprompt=local!/dev/sdF0/fs
+
+(add *ncpu=1 to force a single-cpu boot if you want to take
+secondary bring-up out of the picture while debugging.)
 
 (virtio-blk disks are lettered from 'F' by sdvirtio10's viopnp;
 the first -disk is always sdF0.)
@@ -137,18 +143,20 @@ Build and boot:
 
     # on Plan 9 (source bound at /sys/src/9/vz64)
     cd /sys/src/9/vz64 && mk
-    # produces 9vz (a.out) and 9vz.u (uImage via aux/aout2uimage)
+    # produces 9vz (a.out), 9vz.u (uImage via aux/aout2uimage),
+    # and 9vz.bin (the uImage header stripped -- ready to boot)
 
     # on the mac
-    dd if=9vz.u of=9vz.bin bs=64 skip=1     # strip uImage header
     ./9vz -kernel 9vz.bin -disk 9front.raw \
         -cmdline 'console=0 ...'
 
-The dd strips aout2uimage's 64-byte U-Boot wrapper, exposing the
-embedded arm64 header at offset 0.  check_kernel.sh (in the 9vz
-repo) validates the header.  No further conversion is needed; the
-older mkarm64hdr.py prepend-a-header approach is obsolete (and
-will refuse to run on a binary that already has the magic).
+The $CONF.bin target strips aout2uimage's 64-byte U-Boot wrapper
+(a single dd, bs=64 skip=1) as part of the build, exposing the
+embedded arm64 header at offset 0.  The old manual host-side dd
+step is gone.  check_kernel.sh (in the 9vz repo) validates the
+header.  No further conversion is needed; the older mkarm64hdr.py
+prepend-a-header approach is obsolete (and will refuse to run on a
+binary that already has the magic).
 
 
 4. VZ-specific adaptations
@@ -243,7 +251,11 @@ TX is polled and synchronous: putc posts single characters via
 descriptor 0 (iprint/panic path), kick posts batches via
 descriptor 1 (queued print path).  Both wait for the device to
 consume the descriptor before reusing it -- see the txwait bug in
-section 6.5 for why this wait must be real.
+section 6.5 for why this wait must be real.  putc (interrupt
+context) and kick (process context) can run on different cpus, so
+both wrap their txwait/txpost pairs in the vcon.txl ilock; this
+keeps two cpus from interleaving descriptor/avail updates on the
+single tx queue (required for SMP, verified clean on a 2-cpu boot).
 
 4.7 DTB parsing
 
@@ -355,7 +367,51 @@ See 4.2.  Writing PMU system registers undef-traps under VZ.  The
 writes were vestigial in clockinit but fatal once vectors were up,
 panicking into the invisible pre-links console buffer.
 
-6.7 General technique
+6.8 SMP: the redistributor that wouldn't be found
+
+Bringing up cpu1 hit a chain of failures, each masking the next.
+PSCI CPU_ON first returned -1 (NOT_SUPPORTED): the SMC32 id
+0x84000003 is wrong for a call that takes a 64-bit entry address;
+VZ wants the SMC64 id 0xC4000003 (what Linux uses).  The
+argument-less PSCI calls (SYSTEM_OFF/SYSTEM_RESET) only exist as
+SMC32 and had worked all along, which is why the conduit looked
+fine until CPU_ON.
+
+With CPU_ON fixed, cpu1 started and ran to intrinit -> getrregs,
+where it panicked: "no re-distributor for cpu 1".  getrregs
+identified a cpu's GICv3 redistributor by matching GICR_TYPER
+against machno.  Several theories about the match field
+(Processor_Number vs affinity) and the frame stride (0x20000 vs
+the GICv4/VLPI 0x40000) were tried and failed, each producing the
+same panic.
+
+Diagnostic tracing (a dumprregs() that walks and prints every
+frame) settled it.  The dump showed BOTH cpu0's and cpu1's frames
+reporting GICR_TYPER ALL-ZERO -- affinity word, Processor_Number,
+Last and VLPIS all read 0.  Nothing in the GIC distinguishes cpu1
+from cpu0; affinity matching is simply impossible under VZ.  cpu0
+"worked" only because want==0 accidentally equalled the zeroed
+field.  But the frames ARE laid out one-per-cpu, in cpu order,
+0x20000 apart, with the region terminated by unmapped all-ones
+space (a 0xffffffff read that decodes as Last+VLPIS -- the red
+herring that had fed the stride theories).
+
+The fix stops reading identity out of a zeroed TYPER and uses the
+one fact the dump proved: positional layout.  getrregs prefers a
+real affinity match (for actual hardware / qemu) but only counts
+it when the field is non-zero, then falls back to indexing the Nth
+frame by machno, bounded by the DTB-advertised GICR region.  Two
+companion fixes were needed: GICR_WAKER.ProcessorSleep had to be
+cleared on the secondary before its SGI/PPI frame would respond
+(else no timer interrupts, silent wedge), and bootargs.c had to
+identify the GIC node by its `compatible` = "gic-v3" string rather
+than node name so gicrbase/gicrsize actually populated.
+
+Moral: when a hardware identity register reads all-zero, stop
+trying to match on it.  Trust the structural layout the hardware
+actually exposes, and add a dumper before guessing a fourth time.
+
+6.9 General technique
 
   - vzstop() bisection: move a single probe through main(),
     rebuild, relaunch.  Clean stop = code above the probe works.
@@ -372,43 +428,73 @@ panicking into the invisible pre-links console buffer.
     not the code.
 
 
-7. Known issues and TODO
-------------------------
+7. Resolved milestones and remaining TODO
+-----------------------------------------
 
-  - Userspace bring-up: chandevreset completes through ether
-    probe; sd/virtio-blk discovery, userinit, schedinit, init0,
-    and the boot process are the current frontier.
-  - SMP: first attempt failed cleanly -- PSCI CPU_ON with the
-    SMC32 id 0x84000003 returns -1 NOT_SUPPORTED under VZ.  The
-    SMC64 id 0xC4000003 is now used (matches Linux) but is
-    UNTESTED.  The secondary path itself (BSS clear gated to
-    cpu0, WFE parking removed, per-cpu GIC/timer init) is
-    audited but has never executed under VZ.  Keep *ncpu=1 in
-    the cmdline until this is verified.
-  - main.c still calls fmtlclear() before quotefmtinstall(); this
-    was a workaround from the load-offset era and is almost
-    certainly removable now.  The corresponding helpers
-    (fmtlclear/fmtlwhere) added to /sys/src/9/port/print.c must
-    be reverted to stock before any sysupdate; they are the only
-    out-of-tree modification to shared port code.
-  - The C-level BSS zeroing loop at the top of main() may be
-    redundant now that the load offset is fixed (the l.s clear
-    may work, or may still be needed -- untested either way).
-    Harmless to keep.
-  - putc (iprint/panic) and kick (queued output) can in principle
-    race on the TX vring from interrupt context; they use separate
-    descriptors but share avail ring index updates.  Needs an
-    ilock or equivalent eventually.
-  - The early-boot ring buffer flush order vs. rx interrupt enable
-    could drop console input arriving during flush (cosmetic).
+7.0 Resolved (was "Known issues" in earlier drafts)
+
+  - Userspace bring-up: DONE.  chandevreset, virtio-blk
+    discovery, userinit, schedinit, init0 and the boot process
+    all work; the kernel reaches an interactive rc prompt on an
+    hjfs root over virtio-blk.
+  - SMP: DONE and verified.  A 2-cpu guest (9vz default -cpus 2,
+    *ncpu unset) boots cleanly to the rc prompt with cpu1 online.
+    The decisive fixes:
+      * PSCI CPU_ON needs the SMC64 id 0xC4000003 (the SMC32
+        0x84000003 returns -1 NOT_SUPPORTED under VZ).
+      * getrregs cannot match a redistributor by affinity under
+        VZ -- GICR_TYPER reads ALL-ZERO for every frame.  It now
+        uses a POSITIONAL fallback: cpu N takes the Nth 0x20000
+        redistributor frame, bounded by the DTB-advertised GICR
+        region.  (See section 6.8 for the full diagnosis.)
+      * GICR_WAKER.ProcessorSleep must be cleared on a secondary
+        (and ChildrenAsleep observed low) before its SGI/PPI
+        frame responds, or the secondary never gets a clock.
+      * bootargs.c identifies the GIC node by its `compatible`
+        property containing "gic-v3" (not by node name), so the
+        gicrbase/gicrsize that bound the walk actually populate.
+      * main.c BSS clear gated to cpu0; uartvz TX serialised with
+        the vcon.txl ilock (section 4.6).
+    CPU count is NOT limited to two: conf.nmach comes from the
+    DTB / *ncpu, the redistributor walk and cpumpid[] are sized
+    by MAXMACH, and getrregs indexes by machno.  To try more
+    cpus, launch 9vz with -cpus N (N <= the framework's
+    maximumAllowedCPUCount, typically the host physical-core
+    count) and leave *ncpu unset.  Bring-up instrumentation is
+    retained but gated behind *gicdebug / *smpdebug (quiet by
+    default); see NOTES for what each switch prints.
+  - The out-of-tree print.c workaround (fmtlclear/fmtlwhere) has
+    been REVERTED to stock: the helpers are gone from
+    /sys/src/9/port/print.c, the declarations are gone from
+    fns.h, and the fmtlclear() call is gone from main.c.  Boot
+    without it works (the load-offset fix was the real cause of
+    the "fmtl garbage").  There is no longer any modification to
+    shared port code.
+  - uartvz TX vring race between putc and kick: FIXED with the
+    vcon.txl ilock around txwait/txpost in both paths.  Verified
+    clean on a 2-cpu boot (no garbled console).
+
+7.1 Remaining TODO
+
+  - The C-level BSS zeroing loop at the top of main() (gated to
+    cpu0) may be redundant now that the load offset is fixed and
+    l.s clears BSS; harmless to keep, untested whether removable.
+  - The early-boot ring buffer flush order vs. rx interrupt
+    enable could drop console input arriving during flush
+    (cosmetic).
   - rebootcode/reboot path untested under VZ (PSCI SYSTEM_RESET
     works for exit; warm reboot into a new kernel is unexplored).
   - vgasize/console settings in -cmdline are passed through but
     no display device exists; framebuffer support via
-    VZVirtioGraphicsDevice would be a separate project.  The
-    practical graphics path today is service=cpu plus drawterm
-    from the host over the NAT subnet (rcpu/tcp17019, dp9ik);
-    see NOTES for the conversion recipe.
+    VZVirtioGraphicsDevice (virtio-gpu) plus devdraw/devmouse
+    would be a separate project.  The practical graphics path
+    today is service=cpu plus drawterm from the host over the
+    NAT subnet (rcpu/tcp17019, dp9ik); see NOTES for the
+    conversion recipe.
+  - Higher cpu counts (>2) are plausible but unverified -- the
+    code has no 2-cpu assumption, but only -cpus 2 has been
+    exercised.  Use *gicdebug/*smpdebug if a higher count
+    misbehaves.
   - The svcmode EL2 path in l.s is dead code under VZ (guests
     enter at EL1) but retained for portability.
 
@@ -422,21 +508,25 @@ panicking into the invisible pre-links console buffer.
     mem.c        mmuidmap, mmu0init, meminit
     mmu.c        kernel/user page tables, kmapram, l1map, asid
     trap.c       vectors, syscall/trap/irq dispatch
-    gic.c        GICv3 distributor/redistributor
+    gic.c        GICv3 distributor/redistributor (positional
+                 getrregs fallback, GICR_WAKER wake, dumprregs)
     clock.c      generic virtual timer, no PMU
     fpu.c        FP/SIMD context
     uartvz.c     virtio-console driver (two-phase, see 4.6)
-    bootargs.c   DTB parsing, plan9.ini-style config
+    bootargs.c   DTB parsing, plan9.ini-style config, cpu MPIDs
+                 (cpumpid[]), GIC region (gicrbase/gicrsize)
     pciqemu.c    PCI ECAM config space access
     sysreg.c     MSR/MRS access helpers
     devrtc.c     PL031 RTC
     dat.h        Mach, PFPU, MMMU, register conventions
                  (m = R27, up = R26)
     mem.h        memory map (section 2)
-    fns.h        prototypes, incl. vzstop/restoreregs debug aids
+    fns.h        prototypes, incl. cpumpid/gicrbase exports and
+                 vzstop/restoreregs/dumprregs debug aids
     io.h         IRQ numbers, device addresses
     vz           kernel configuration (devices: section 5 list)
-    mkfile       build rules (objtype=arm64, loadaddr, aout2uimage)
+    mkfile       build rules (objtype=arm64, loadaddr, aout2uimage,
+                 $CONF.bin uImage-header strip)
     NOTES        raw bring-up log (the unpolished version of
                  section 6)
 

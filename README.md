@@ -6,8 +6,8 @@ Apple's Virtualization.framework (VZ) on Apple silicon Macs, via
 VZLinuxBootLoader -- no firmware, no U-Boot, no emulated legacy
 hardware.  It boots to an interactive rc prompt on an hjfs root
 filesystem over virtio-blk, with working virtio console, GICv3
-interrupts, ARM virtual timer, and virtio networking, and supports
-graphical use via drawterm from the host.
+interrupts, ARM virtual timer, virtio networking, and SMP (multi-
+cpu), and supports graphical use via drawterm from the host.
 
 This port was generated with Claude Opus (Anthropic) and Fable,
 working with a human who ran every build and boot.  The kernel
@@ -21,9 +21,10 @@ virtio devices, and the serial console on stdio.
 
 Status
 ------
-Working: single-CPU boot to rc prompt and drawterm-in, on a stock
-9front arm64 disk image (hjfs).  SMP is plumbed but not yet
-working under VZ -- see TODO at the bottom.
+Working: boot to rc prompt and drawterm-in, on a stock 9front
+arm64 disk image (hjfs).  SMP works: a multi-cpu guest (9vz
+default -cpus 2, *ncpu unset) boots cleanly with the secondary
+cpus online.  *ncpu=1 still forces a single-cpu boot.
 
 Booting it
 ----------
@@ -33,19 +34,20 @@ Build (on a Plan 9/9front system, with this directory bound over
     cd /sys/src/9/vz64
     mk
 
-This produces 9vz (a.out) and 9vz.u (uImage).  On the Mac:
+This produces 9vz (a.out), 9vz.u (uImage), and 9vz.bin (the
+uImage header stripped -- ready to boot; the dd that used to be a
+manual mac-side step is now a build target).  On the Mac:
 
-    dd if=9vz.u of=9vz.bin bs=64 skip=1     # strip uImage wrapper
     ./check_kernel.sh 9vz.bin               # (in the 9vz repo) should
                                             # report the arm64 header
     ./9vz -kernel 9vz.bin -disk 9front.raw -cmdline 'console=0
-    *ncpu=1
     nobootprompt=local!/dev/sdF0/fs'
 
 The cmdline parameters that matter:
 
     console=0                    serial console (the only console)
-    *ncpu=1                      stay single-cpu (SMP is TODO)
+    *ncpu=1                      optional: force single-cpu (SMP
+                                 works; omit to use all -cpus N)
     nobootprompt=local!/dev/sdF0/fs
                                  root from the first virtio-blk
                                  disk.  sdvirtio10 letters virtio-
@@ -86,7 +88,7 @@ VZ-specific adaptations, each of which was a bring-up bug first:
   * No PMU.  VZ guests trap on PMCR_EL0 and friends; all cycle
     counting uses the virtual counter CNTVCT_EL0 (24 MHz).
   * PSCI over HVC for power control: SYSTEM_OFF/SYSTEM_RESET for
-    exit/reboot, CPU_ON for secondary cpus (see TODO).
+    exit/reboot, CPU_ON (SMC64 id 0xC4000003) for secondary cpus.
   * The console is virtio-console, brought up in two phases:
     before PCI is scanned, print output buffers in a memory
     ring; uartvzlink() (during links()) probes the device,
@@ -117,25 +119,32 @@ rcpu/tcp17019, or a simpler listen1-based setup.  The Mac can
 reach the guest's DHCP address directly (Apple NAT, bridge100;
 note 192.168.64.1 is the HOST, not the guest).
 
+Done since first bring-up
+-------------------------
+  * SMP.  Verified: a 2-cpu guest boots to the rc prompt with
+    cpu1 online.  The decisive fixes were the SMC64 PSCI CPU_ON
+    id (0xC4000003 -- the SMC32 0x84000003 returns -1
+    NOT_SUPPORTED), a POSITIONAL getrregs fallback (VZ's
+    GICR_TYPER reads all-zero, so affinity matching is
+    impossible -- cpu N takes the Nth redistributor frame),
+    clearing GICR_WAKER on the secondary, and matching the GIC
+    DTB node by `compatible` = "gic-v3".  CPU count is not
+    capped at two; omit *ncpu and use 9vz -cpus N.  See PORT.txt
+    section 6.8 and NOTES for the full diagnosis.
+  * uartvz TX locking: putc (iprint/panic) and kick (queued
+    output) now share the vcon.txl ilock around the TX vring, so
+    two cpus cannot interleave descriptor/avail updates.
+
 TODO
 ----
-  * SMP.  mpinit issues PSCI CPU_ON for secondaries; under VZ the
-    SMC32 function id (0x84000003) returns -1 NOT_SUPPORTED:
-
-        mpinit: PSCI CPU_ON cpu1 failed: -1
-
-    The code now uses the SMC64 id (0xC4000003), which is what
-    Linux uses on arm64 and matches the failure signature (the
-    argument-less PSCI calls, which only exist as SMC32, all
-    work).  This fix is UNTESTED -- boot without *ncpu=1 to try
-    it.  The rest of the secondary path (BSS clear gated to
-    cpu0, no WFE parking, per-cpu GIC/timer init) has been
-    audited but never executed under VZ.
-  * uartvz TX locking: putc (iprint/panic) and kick (queued
-    output) can race the TX vring from two cpus; fine today on
-    one cpu, needs an ilock for SMP.
   * virtio-gpu + devdraw/devmouse for native graphics.
-  * The early console ring flush vs rx interrupt ordering.
+  * The early console ring flush vs rx interrupt ordering
+    (cosmetic: input arriving during flush could be dropped).
+  * Higher cpu counts (>2) are plausible but unverified -- the
+    code has no 2-cpu assumption, but only -cpus 2 has been
+    exercised.
+  * rebootcode/reboot path untested under VZ (SYSTEM_RESET works
+    for exit; warm reboot into a new kernel is unexplored).
 
 Files
 -----
