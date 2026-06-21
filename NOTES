@@ -55,6 +55,415 @@ switches -- those only fire on failure.  cpuidprint() still prints
 "cpuN: Apple Virtualization.framework" per cpu, so a healthy boot
 confirms every secondary online without any debug switch.
 
+Native GUI: IN PROGRESS -- host window opens, guest drivers TODO
+----------------------------------------------------------------
+The plan is a native graphics path so a 9front guest runs rio in a
+real macOS window (not just drawterm).  Work is split host/guest;
+the host half is the 9vz launcher (mac), the guest half is driver
+work in this kernel.  Launch with 9vz -gui (adds a virtio-gpu
+device with one scanout, a USB keyboard, and a USB absolute-coord
+pointing device; serial still flows on stdio).
+
+GUI Bug 1: -gui crashed on the HOST before the window opened (FIXED)
+  Symptom: a full, clean guest boot (all cpus to schedinit, "state:
+  running"), then the 9vz process itself crashed on the mac side:
+      SIGTRAP: trace trap
+      signal arrived during cgo execution
+      ...startVirtualMachineWindow...
+      ...(*VirtualMachine).StartGraphicApplication...
+      ...main.main (main.go:197)
+  i.e. NOT a kernel fault -- the guest was fine; the host launcher
+  trapped inside AppKit as it tried to create the window.
+  ROOT CAUSE (host, 9vz/main.go): AppKit ([NSApplication
+  sharedApplication] / [NSApp run], reached via vz's
+  StartGraphicApplication -> startVirtualMachineWindow) MUST run on
+  the process's main OS thread (the startup thread, m0).  main.go
+  called runtime.LockOSThread() inside main(), right before
+  StartGraphicApplication -- too late: by then the Go scheduler had
+  migrated goroutine 1 onto another M, so the lock pinned AppKit to
+  a NON-main thread and AppKit aborted via a brk (-> SIGTRAP).  The
+  crash dump confirmed it: "goroutine 1 ... m=4 ... locked to
+  thread" -- m=4, not m0; and register r6 spelled "ispatch" (a
+  libdispatch/main-thread assertion).
+  FIX (host, 9vz/main.go): move runtime.LockOSThread() into an
+  init() function.  init and main.main both run on goroutine 1,
+  which starts life on the process main/startup thread; locking in
+  init() pins it there before the scheduler can move it, so AppKit
+  ends up on the thread it requires.  Removed the now-redundant
+  LockOSThread() in the -gui branch.  Headless boots unaffected
+  (the lock just stays held, harmless).
+  This bug is entirely host-side; no vz64 kernel change.  The fix
+  lives in the 9vz repo (mac), not here.  Recorded here because the
+  crash LOOKED like it might be ours (it followed a kernel boot)
+  and the next GUI bugs WILL be ours.
+
+  STATUS after the fix: window should open (titled "9vz") but paint
+  BLACK -- expected.  The guest-side virtio-gpu/keyboard/mouse
+  drivers below are not written yet, so nothing drives the scanout.
+  [SUPERSEDED: the virtio-gpu driver IS now written (screen.c) and
+  gets through the handshake + GET_DISPLAY_INFO; it stalled at
+  RESOURCE_CREATE_2D (GUI Bug 2, format-probe fix), then -- with
+  create-2d passing -- at RESOURCE_ATTACH_BACKING, which a bogus
+  size guard failed SILENTLY (GUI Bug 3, fix applied).  With Bug 3
+  fixed the scanout setup should complete and the window paint.
+  Latest -gui boot still showed a BLACK window: that boot was the
+  pre-Bug-3 binary (scanout setup failed at attach-backing).]
+
+GUI Bug 2: RESOURCE_CREATE_2D rejected -- err-invalid-parameter (FIX APPLIED)
+  Symptom: the virtio-gpu driver (screen.c) now does the virtio 1.0
+  handshake, brings up the control queue, and the FIRST control-
+  queue round trip succeeds:
+      virtio-gpu: PCI.0.8.0 did 0x1050 rid 1
+      virtio-gpu: scanout0 1024x768 enabled=1
+  i.e. GET_DISPLAY_INFO works (queue, descriptors, notify, used-ring
+  poll, response parse all correct, and the host reports a live
+  1024x768 scanout).  The very next command, RESOURCE_CREATE_2D,
+  fails:
+      virtio-gpu: create-2d: err-invalid-parameter (0x1205)
+      virtio-gpu: scanout setup failed
+  DIAGNOSIS: by the virtio-gpu spec the parameters were all valid
+  (resource_id 1 != 0, width 1024, height 768, format
+  B8G8R8A8_UNORM = 1).  A QEMU/Linux host accepts exactly that.  But
+  err-invalid-parameter from CREATE_2D means a field was rejected,
+  and since geometry and resource_id are fine, the suspect is the
+  pixel FORMAT: Apple Virtualization.framework's virtio-gpu
+  whitelists a narrower set of virtio_gpu_formats than QEMU, and the
+  one we hardcoded is evidently not on it.  (GET_DISPLAY_INFO does
+  not name a format, which is why it sailed through and create-2d is
+  the first command to exercise the whitelist.)
+  FIX (screen.c): stop hardcoding the format.  gpucreate2d() now
+  PROBES a candidate list (gpufmts[], B8G8R8X8/B8G8R8A8/X8R8G8B8/...
+  most-likely-first for an XRGB32 [B,G,R,X]-in-memory framebuffer),
+  retrying RESOURCE_CREATE_2D down the list and accepting the first
+  format the host does NOT reject with err-invalid-parameter.  The
+  chosen format is remembered in gpufmt.  Retry is safe because a
+  CREATE_2D that returns invalid-parameter does not create the
+  resource, so resource_id 1 is still free for the next attempt.
+  Any NON-invalid-parameter error (out-of-memory, etc.) breaks out
+  immediately and is printed -- so if the real cause turns out NOT
+  to be the format, the next boot says so instead of silently
+  burning through all 8 candidates.  A successful non-default format
+  is announced ("host accepted format %#ux (not %#ux)") so we learn
+  which format VZ actually wants and can promote it to the head of
+  the list (or hardcode it) later.
+  UNTESTED -- compiles clean (mk in /sys/src/9/vz64).  Next boot
+  with 9vz -gui: read the create-2d line.
+    - "host accepted format 0xN" => fixed; note N, expect the boot
+      to proceed to attach-backing / set-scanout (the next two
+      candidates for an err- line).
+    - "host rejected all 8 formats" => the problem is NOT the format
+      whitelist after all; re-examine the CREATE_2D struct layout
+      (Gpucreate2d: hdr 24 + resid/format/width/height) or whether
+      VZ wants a 3D/virgl context first.
+    - a different err- name printed => that error (not invalid-
+      parameter) is the real blocker; chase it directly.
+
+GUI Bug 2 -- WHAT TO CAPTURE ON THE NEXT TEST (read this first next session)
+  Kernel built clean this session (mk in /sys/src/9/vz64; 9vz.bin
+  regenerated).  Only screen.c changed -- the format-probe in
+  gpucreate2d().  No host (9vz/main.go) change this round.
+
+  HOW TO RUN: boot 9vz -gui with the SAME disk/cmdline you used
+  for the run that produced the create-2d error.  Serial still
+  flows on stdio, so the virtio-gpu: lines come out on the host
+  terminal exactly as before.  (Reminder GOTCHA: do not run a
+  headless boot of the same 9front.raw at the same time; fshalt
+  the guest before stopping the VM.)
+
+  PASTE BACK, VERBATIM, the virtio-gpu block from boot.  It will be
+  ONE of these shapes -- each tells me precisely where we are:
+
+  (1) FIXED, default format was just wrong:
+        virtio-gpu: PCI.0.8.0 did 0x1050 rid 1
+        virtio-gpu: scanout0 1024x768 enabled=1
+        virtio-gpu: create-2d: host accepted format 0xN (not 0x2)
+        ... (no "scanout setup failed") ...
+      => tell me N.  I will promote 0xN to the head of gpufmts[]
+         (or hardcode it) so we stop probing.  Then the open
+         question is whether the WINDOW ACTUALLY PAINTS the orange
+         "Plan 9 Console" banner -- say whether it does, because a
+         clean create/attach/scanout with a BLANK or GARBLED window
+         means the format the host ACCEPTED does not match our
+         XRGB32 byte order (wrong colours / swapped channels) and
+         we pick a different accepted candidate.
+
+  (2) create-2d passes silently (host accepted format 0x2, our
+      first candidate, so NO "host accepted" line prints) but a
+      LATER command fails:
+        virtio-gpu: scanout0 1024x768 enabled=1
+        virtio-gpu: attach-backing (N entries): err-... (0x12xx)
+            -- or --
+        virtio-gpu: set-scanout: err-... (0x12xx)
+        virtio-gpu: scanout setup failed
+      => create-2d was never the real blocker (format 0x2 was fine
+         all along) OR it is fixed and the NEXT command is the new
+         frontier.  Paste the exact err- line; I will chase that
+         command.  For attach-backing also tell me the entry count
+         N (sanity-checks the framebuffer page math).
+
+  (3) STILL stuck, all formats rejected:
+        virtio-gpu: create-2d: host rejected all 8 formats
+      => it is NOT the format whitelist.  Next suspects, in order:
+         (a) CREATE_2D struct/layout vs what VZ parses; (b) VZ
+         wants a 3D/virgl context created first; (c) the resource
+         id or geometry after all.  Tell me and I will add a
+         byte-level dump of the outgoing command + the raw 24-byte
+         response header so we stop guessing.
+
+  (4) a DIFFERENT named error on create-2d (not invalid-parameter):
+        virtio-gpu: create-2d: err-out-of-memory (0x1201)  (e.g.)
+      => the probe loop bailed on the first non-invalid-parameter
+         error.  Paste it; that specific error is the real cause
+         and I chase it directly (e.g. out-of-memory => host-side
+         resource limit / wrong size).
+
+  ALSO USEFUL IF YOU HAVE IT (optional, only if easy):
+    - whether the macOS "9vz" window shows the orange-bar console
+      or stays black -- this is the real end-to-end success signal,
+      independent of the serial log.
+    - if the guest reaches the rc prompt: is there a #v (draw) /
+      #m (mouse) device now?  (bind -b '#v' /dev; ls /dev/draw)
+      Input (USB-HID kbd/mouse) is still unwritten, so do not
+      expect a usable cursor yet -- we are only proving the SCANOUT
+      paints.
+    - the file-IO-slowness question from last session: say whether
+      THIS boot felt slow, and whether it was a -gui or headless
+      boot.  My read is our screen.c work cannot slow headless IO
+      (the driver is dormant with no GPU device); if -gui feels
+      sluggish once it paints, the suspect is the synchronous
+      per-character flushmemscreen (ilock + polled transfer+flush)
+      in the console path, which we would then batch/throttle.
+
+GUI Bug 3: attach-backing silently failed -- bogus size guard (FIX APPLIED)
+  Symptom (this session): a -gui boot got PAST create-2d (format 0x2
+  accepted silently, no "host accepted" line) but printed:
+      virtio-gpu: scanout0 1024x768 enabled=1
+      virtio-gpu: scanout setup failed
+  with NO create-2d / attach-backing / set-scanout error line in
+  between, and the 9vz window stayed pure black.  "no preceding
+  error" is the whole tell: every failing helper prints its own
+  err- line EXCEPT two silent `return -1` paths in
+  gpuattachbacking() -- the buf==nil OOM path and a size guard
+      if(sz > sizeof(vgpu.cmd)) return -1;
+  ROOT CAUSE: that size guard was wrong.  attach-backing builds its
+  command in its OWN mallocz(sz) buffer (because the scatter list is
+  one virtio_gpu_mem_entry per framebuffer PAGE and can be large),
+  NOT in the 1KB gpucmd scratch vgpu.cmd.  For 1024x768x4 the
+  framebuffer is 768 pages => sz = 32 (hdr+resid+nentries) +
+  768*16 (mementry) = 12320 bytes.  12320 > sizeof(vgpu.cmd)==1024,
+  so the guard tripped and returned -1 SILENTLY, surfacing only as
+  the generic "scanout setup failed".  The guard was a copy/paste
+  leftover from gpucmd()'s real bound; attach-backing does not use
+  that buffer at all.
+  FIX (screen.c gpuattachbacking): delete the sz>sizeof(vgpu.cmd)
+  guard; the command lives in its own buffer whose size is whatever
+  the page count requires.  Also gave the remaining OOM path
+  (mallocz==nil) a print() so it can never again fail mute.  The
+  command is still issued as a single virtio descriptor pointing at
+  the contiguous mallocz buffer (kernel pool allocations are
+  physically contiguous in the KZERO direct map, the same
+  assumption every other PADDR-on-malloc site in the kernel makes).
+  UNTESTED -- compiles clean (mk in /sys/src/9/vz64; 9vz.bin
+  regenerated).  Next -gui boot should now get create-2d + attach-
+  backing + set-scanout all OK and PAINT the orange "Plan 9
+  Console" banner.  See the capture list below.
+
+GUI Bug 3 -- WHAT TO CAPTURE ON THE NEXT TEST
+  Boot 9vz -gui with the same disk/cmdline.  Paste the virtio-gpu
+  block and say whether the macOS "9vz" window paints.  Expected
+  shapes:
+  (1) FIXED, window paints the orange-bar console:
+        virtio-gpu: scanout0 1024x768 enabled=1
+        (no "scanout setup failed")
+      => the scanout path works end to end.  Then the open
+         questions are (a) COLOURS: is the banner actually orange
+         on a black/white console, or are channels swapped (wrong-
+         format tell -> we pick a different gpufmts[] candidate),
+         and (b) does the rc prompt now show #i (draw) -- try
+         `bind -b '#i' /dev; ls /dev/draw`.
+  (2) attach-backing now prints a REAL error instead of failing
+      mute:
+        virtio-gpu: attach-backing (768 entries): err-... (0x12xx)
+      => the page math is exercised (entry count 768 confirms the
+         framebuffer size) and the host rejected the scatter list;
+         paste the err- name and I chase that (likely a contiguity
+         or addr-range issue, or VZ wanting a different entry
+         layout).
+  (3) set-scanout now the frontier:
+        virtio-gpu: set-scanout: err-... (0x12xx)
+      => create+attach were fine; paste the err-.
+  Input (USB-HID kbd/mouse) is still unwritten -- do not expect a
+  usable cursor yet; we are only proving the SCANOUT paints.
+
+GUI Bug 3b: spec-driven lifecycle tracing added (THIS SESSION)
+  A second opinion framed the debug the right way: classify the
+  problem (2D scanout / backing / 3D-capset), use the virtio 1.3
+  GPU spec as normative, compare to QEMU 2D first, and do NOT
+  assume virgl/blob/hostmem unless Apple exposes host-visible blob
+  resources + a hostmem window + capset negotiation + renderer
+  integration.  Working through our code against that discipline:
+    - PROBLEM CLASS: 2D scanout + resource backing.  Not 3D.  We
+      never negotiate virgl/blob/context-init, so capset
+      negotiation is irrelevant -- correctly so.
+    - FEATURES: we accept ONLY VIRTIO_F_VERSION_1 (word1 bit0) and
+      drive feature WORD 0 entirely to zero.  Word 0 is where the
+      virtio-gpu options live (VIRGL=0 EDID=1 RESOURCE_UUID=2
+      RESOURCE_BLOB=3 CONTEXT_INIT=4); zeroing it keeps us on the
+      plain 2D path QEMU implements.  This already satisfies the
+      "do not assume virgl/blob/hostmem" caution -- no code change
+      needed there, it was a confirmation not a fix.
+    - 64-bit queue-register writes (vout64) are a single aligned
+      MMIO store; virtio-net and virtio-blk use the identical path
+      under VZ and work, so the queue setup is not the divergence.
+    - FIRST DIVERGENCE on the last boot was attach-backing, and it
+      was OUR bug (the bogus 1KB size guard, GUI Bug 3), not a host
+      behaviour difference.
+  So the second opinion did not point at a new root cause -- but it
+  correctly insisted we stop INFERRING the lifecycle and TRACE it.
+  Instrumentation added this session (screen.c, compiles clean):
+    - gpuprobe: reads and PRINTS both offered feature words and the
+      driver-accepted bits:
+        virtio-gpu: devfeat <w1>:<w0> drvfeat <w1>:<w0>
+      so the next boot shows outright whether VZ even offers virgl/
+      blob (expected: it does not / we take none).
+    - gpucreate2d: now ALWAYS prints the accepted format and which
+      candidate index it was (was silent for the default format):
+        virtio-gpu: create-2d: ok, host accepted format 0xN
+                    (candidate K of 8)
+    - screeninit: a per-step transcript -- a "setup WxHx32 fb ..."
+      line, then explicit ok/failed markers after create-2d,
+      attach-backing, and set-scanout, and distinct
+        scanout setup failed at <create-2d|attach-backing|set-scanout>
+      messages so the failing COMMAND is named (no more bare
+      "scanout setup failed").
+    - screeninit: brackets the first flush --
+        virtio-gpu: control path up; painting console banner
+        virtio-gpu: first flush issued; window should paint now
+      so a black window WITH all-ok control lines localises the bug
+      to the TRANSFER_TO_HOST_2D/RESOURCE_FLUSH data path (offset/
+      stride/rect) rather than resource setup.
+  NET: behaviour unchanged except for prints; the next -gui boot is
+  now self-describing.  Read the transcript top to bottom; the last
+  "ok" line names the last command the host accepted, and the
+  "first flush issued" line vs a black window separates control-path
+  from data-path bugs.
+
+GUI Bug 4: -gui throttled file I/O by orders of magnitude (FIX APPLIED)
+  Symptom (the human, running with a serial console only): booting
+  with 9vz -gui sent guest LOAD way up and dropped file-system
+  performance by SEVERAL ORDERS OF MAGNITUDE versus a headless
+  boot.  Open question last session was whether 9vz was spamming
+  the kernel or the driver was to blame.  It is the driver.
+
+  ROOT CAUSE (screen.c, the virtio-gpu flush path).  flushmemscreen
+  drove the control queue SYNCHRONOUSLY with interrupts DISABLED:
+      ilock(&vgpu);                 // splhi -- interrupts OFF
+      gputransfer(...);             // notify + busy-spin on used ring
+      gpuflush(...);                // notify + busy-spin on used ring
+      iunlock(&vgpu);
+  and ctlcmd's wait was a bare
+      while(q->used->idx == q->lastused) coherence();
+  So EVERY flushmemscreen:
+    (a) held splhi across TWO full host round trips.  VZ's virtio
+        backend is a concurrent host thread, so each round trip is
+        a notify (VM exit) plus host scheduling latency -- and for
+        that whole window the guest could take NO interrupts: not
+        the virtual timer, and crucially NOT the virtio-blk
+        completion interrupt.  The root filesystem runs over
+        virtio-blk, so its I/O completions were stalled behind a
+        storm of flushes.  With *ncpu=1 there was no other cpu to
+        make progress either.  That is the orders-of-magnitude
+        slowdown.
+    (b) BUSY-WAITED (spun) instead of yielding, so the cpu burned
+        100% during every flush -> the load spike.
+  And devdraw calls flushmemscreen for every dirty rectangle, so
+  rio (cursor blink, text, window ops) produced a continuous flush
+  storm.  Headless boots were unaffected because the driver is
+  dormant with no GPU device -- exactly the prediction in the
+  "GUI Bug 2 -- WHAT TO CAPTURE" note ("the suspect is the
+  synchronous per-character flushmemscreen (ilock + polled
+  transfer+flush)").
+
+  FIX (screen.c):
+    1. Wait for completion by SLEEPING on the control-queue
+       interrupt instead of busy-spinning with interrupts off.
+       initqueue now leaves the queue interrupt ENABLED (no
+       Rnointerrupt); gpuprobe wires intrenable(...interrupt...)
+       and sets vgpu.intr.  A new interrupt() handler acks the ISR
+       and wakeup()s the queue Rendez (same shape as
+       ethervirtio10.c).  ctlwait()/the gpuxferflush wait loop
+       tsleep on a predicate (ctlhasroom).  tsleep (5ms), not
+       sleep, is a safety net: if VZ ever fails to deliver the
+       used-ring interrupt, the timeout re-polls and we still make
+       progress rather than hang.  cansleep() gates the sleep on
+       vgpu.intr && up!=nil && islo() so the early screeninit
+       bring-up (up==nil, before schedinit) and any !islo() console
+       path fall back to polling -- but polling now WITHOUT forcing
+       interrupts off.
+    2. Replace ilock(&vgpu) on the flush path with a QLock
+       (vgpu.ctll), so the wait runs at spllo with interrupts on.
+       A small ilock (vgpu.il) still covers just the brief vring
+       index/descriptor update the interrupt handler also reads.
+    3. Coalesce the per-flush TRANSFER_TO_HOST_2D + RESOURCE_FLUSH
+       into gpuxferflush(): post BOTH commands' avail entries, then
+       notify ONCE and wait for BOTH completions in one wait spell.
+       Halves the notifies/wakeups per flush.
+  screeninit's ilock/iunlock wrappers around the bring-up commands
+  were removed (single-threaded boot, up==nil so qlock would panic;
+  ctlcmd's internal vgpu.il is the only exclusion needed there).
+  The now-unused gputransfer()/gpuflush() helpers were deleted.
+
+  NET: interrupts are never forced off across a host round trip,
+  the cpu yields while waiting, and there is one round trip per
+  flush instead of two.  File I/O under -gui should no longer be
+  starved by drawing, and the load spike should disappear.
+
+  UNTESTED -- compiles clean (mk in /sys/src/9/vz64; 9vz.bin
+  regenerated).  WHAT TO CAPTURE on the next -gui boot:
+    - confirm the window still paints (the bring-up path now polls
+      rather than spins, but the command sequence is unchanged).
+    - run a file-I/O workload in the guest with the GUI active
+      (e.g. a big cp / tar / dd to the hjfs root) and compare
+      throughput + load (cat /dev/sysstat, or just feel) against a
+      headless boot.  Expectation: comparable now.
+    - if it STILL feels slow under -gui: the next suspect is the
+      flush GRANULARITY (one host round trip per dirty rect is
+      still a lot when rio scribbles).  The follow-on optimisation
+      would be to COALESCE/THROTTLE flushes -- accumulate dirty
+      rects and flush at a bounded rate (e.g. on a timer) rather
+      than one round trip per devdraw operation -- but that is only
+      worth doing if the interrupt-off fix alone is not enough.
+    - if the window goes BLACK or the guest wedges on first flush:
+      suspect the used-ring interrupt is not being delivered for
+      the GPU device (then ctlhasroom never becomes true via
+      interrupt and we rely on the 5ms tsleep timeout).  The boot
+      would still progress (timeout path) but slowly; say so and we
+      either fix the intr wiring (p->intl / tbdf for the GPU) or
+      shorten/remove the sleep in favour of a tuned poll.
+
+GUI guest-side work, NOT STARTED (this is the kernel's half):
+  1. virtio-gpu driver doing the virtio 1.0 handshake (crib the
+     ring/feature-negotiation structure from uartvz.c), then the
+     control queue: GET_DISPLAY_INFO, RESOURCE_CREATE_2D,
+     RESOURCE_ATTACH_BACKING (point at the Plan 9 framebuffer
+     pages), SET_SCANOUT, and TRANSFER_TO_HOST_2D + RESOURCE_FLUSH
+     on update.
+  2. hook that into the soft-framebuffer screen path so
+     flushmemscreen issues the transfer/flush for the dirty
+     rectangle the draw layer already tracks.
+  3. USB-HID input drivers feeding /dev/kbd and /dev/mouse from the
+     VZ keyboard and pointing devices.
+  Suggested first proof (host path, zero kernel work): boot a stock
+  Linux arm64 kernel under 9vz -gui; if a Linux console paints in
+  the window, the whole host path (virtio-gpu + window + input) is
+  proven good and only the guest driver remains.
+
+GOTCHA noted by the human (testing logistics): the disk image
+cannot be shared across concurrent runs, so a -gui boot and a
+headless boot of the same 9front.raw cannot run at the same time.
+Stop one before starting the other (and fshalt the guest first --
+hjfs buffers writes).
+
 Build / image workflow
 ----------------------
 The linker output 9vz goes through aux/aout2uimage producing 9vz.u
@@ -234,7 +643,14 @@ Next projects, roughly in order:
   - service=cpu + auth + drawterm from the mac
   - SMP bring-up (remove *ncpu=1, then -cpus N)   [DONE -- see
     "SMP: DONE" milestone at the top of this file]
-  - virtio-gpu + devdraw/devmouse for native graphics
+  - virtio-gpu + devdraw/devmouse for native graphics   [IN
+    PROGRESS -- host -gui window opens (GUI Bug 1 fixed); guest
+    virtio-gpu driver (screen.c) written: handshake + control
+    queue + GET_DISPLAY_INFO work, currently blocked at
+    RESOURCE_CREATE_2D (GUI Bug 2, format-probe fix applied,
+    awaiting next -gui boot).  USB-HID kbd/mouse still not
+    started.  See "Native GUI" milestone near the top of this
+    file and the "GUI Bug 2 -- WHAT TO CAPTURE" block.]
   - console quirks: putc/kick vring race, rx-during-flush
     [the putc/kick TX race is fixed: vcon.txl ilock now wraps
     both putc and kick in uartvz.c]

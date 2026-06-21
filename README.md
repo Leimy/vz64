@@ -112,12 +112,39 @@ the raw bring-up log.
 
 Graphics
 --------
-There is no framebuffer device (and no virtio-gpu driver yet).
-The practical path is to run the guest as a cpu server and
-connect with drawterm from the Mac over the NAT subnet:
-rcpu/tcp17019, or a simpler listen1-based setup.  The Mac can
-reach the guest's DHCP address directly (Apple NAT, bridge100;
-note 192.168.64.1 is the HOST, not the guest).
+Native graphics works via a virtio-gpu framebuffer.  Launch the
+host runner with -gui (9vz -gui ...); it attaches a virtio-gpu
+device with one scanout plus a USB keyboard and a USB absolute
+pointing device, and opens a real macOS window.  The kernel side
+is:
+
+  * screen.c   a virtio-gpu driver implementing the devdraw
+               screen.c contract (attachscreen / flushmemscreen /
+               software cursor).  It creates one host 2D resource
+               the size of the scanout, attaches a guest linear
+               framebuffer ("softscreen") as backing, binds it to
+               scanout 0, and on each flush issues
+               TRANSFER_TO_HOST_2D + RESOURCE_FLUSH for the dirty
+               rectangle.  The single control queue is driven
+               synchronously (polling the used ring) exactly like
+               the console TX path -- VZ's backend is a concurrent
+               host thread, so the waits are real.
+  * #i (draw), #m (mouse), swcursor are now in the vz config.
+  * USB keyboard and pointer are handled in userspace by nusb
+    (usbd + nusb/kb): kb writes absolute mouse events to
+    /dev/mousein with the 'A'/'a' prefix, which devmouse routes
+    through absmousetrack/scmousetrack.
+
+If 9vz is run without -gui there is no virtio-gpu device;
+screeninit() finds nothing and the kernel stays headless (the
+serial console still works).  vgasize=WxHx32 in -cmdline overrides
+the default 1024x768 scanout size (depth must be 32).
+
+The older path -- run the guest as a cpu server and connect with
+drawterm from the Mac over the NAT subnet (rcpu/tcp17019, or a
+listen1 setup; the Mac reaches the guest's DHCP address directly
+on Apple NAT bridge100, note 192.168.64.1 is the HOST) -- still
+works and needs no display device.
 
 Done since first bring-up
 -------------------------
@@ -137,7 +164,10 @@ Done since first bring-up
 
 TODO
 ----
-  * virtio-gpu + devdraw/devmouse for native graphics.
+  * virtio-gpu hardware cursor (currently swcursor).
+  * virtio-gpu RESIZE / multi-scanout (VZ exposes one scanout;
+    the host -width/-height set it; guest-driven mode set via
+    GET_DISPLAY_INFO is not wired up).
   * The early console ring flush vs rx interrupt ordering
     (cosmetic: input arriving during flush could be dropped).
   * Higher cpu counts (>2) are plausible but unverified -- the
@@ -155,6 +185,8 @@ Files
     mem.c mmu.c  page tables, kmapram, identity/kernel maps
     trap.c gic.c clock.c fpu.c    traps, GICv3, virtual timer, FP
     uartvz.c     virtio-console driver
+    screen.c     virtio-gpu framebuffer (devdraw screen.c contract)
+    screen.h     devmouse/screen/swcursor prototypes
     bootargs.c   DTB / plan9.ini-style config
     pciqemu.c    PCI ECAM access
     sysreg.c devrtc.c             sysreg helpers, PL031 RTC

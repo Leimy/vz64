@@ -129,6 +129,9 @@ extern void	syswr(ulong, uvlong);
 /* uartimx */
 extern void uartconsinit(void);
 
+/* screen (virtio-gpu) */
+extern void screeninit(void);
+
 /* dma */
 extern void dmaflush(int, void*, ulong);
 

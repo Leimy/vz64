@@ -246,6 +246,7 @@ main(uintptr dtb)
 	procinit0();
 	initseg();
 	links();
+	screeninit();
 	chandevreset();
 	userinit();
 	mpinit();

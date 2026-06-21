@@ -257,6 +257,47 @@ both wrap their txwait/txpost pairs in the vcon.txl ilock; this
 keeps two cpus from interleaving descriptor/avail updates on the
 single tx queue (required for SMP, verified clean on a 2-cpu boot).
 
+4.9 Native graphics (screen.c)
+
+VZ's -gui mode (in the 9vz host runner) attaches a
+VZVirtioGraphicsDevice with a single scanout, a USB keyboard, and
+a USB absolute-coordinate pointing device, and opens a macOS
+window.  The guest needs drivers for all three.
+
+screen.c is the virtio-gpu driver.  virtio-gpu (PCI 0x1AF4:0x1050)
+is a virtio 1.0 device with two queues; we use only the control
+queue (queue 0).  Bring-up, like the console, is deferred until
+PCI is up: screeninit() runs from main() right after links().  It:
+
+  * probes the device, negotiates VERSION_1, sets up the control
+    queue (same vring code as uartvz.c / ethervirtio10.c);
+  * RESOURCE_CREATE_2D a host resource the size of the scanout
+    (format B8G8R8A8, which is XRGB32 little-endian);
+  * allocates a guest linear framebuffer (the devdraw
+    "softscreen") and RESOURCE_ATTACH_BACKING it -- one mementry
+    per physical page, though the KZERO direct map makes kernel
+    allocations contiguous so it is effectively one entry;
+  * SET_SCANOUT binds the resource to scanout 0.
+
+devdraw renders into the framebuffer in main memory.  Each
+flushmemscreen(r) issues TRANSFER_TO_HOST_2D (copy the dirty
+rectangle from guest backing into the host resource) followed by
+RESOURCE_FLUSH (present it on the scanout).  The control queue is
+polled synchronously, waiting for the device's used index before
+reusing descriptors -- the same lesson as the console TX path
+(section 6.5): VZ's device side is a concurrent host thread.
+
+The cursor is software (port/swcursor.c); the virtio-gpu hardware
+cursor queue is not used.  #i (draw) and #m (mouse) are in the vz
+config.  Input: nusb in userspace (usbd + nusb/kb) drives the USB
+keyboard and pointer; kb writes absolute events to /dev/mousein
+with the 'A'/'a' prefix, which devmouse routes through
+absmousetrack/scmousetrack to position the cursor.
+
+If no virtio-gpu device is present (9vz without -gui), gpuprobe()
+finds nothing, screeninit() returns quietly, and the kernel runs
+headless on the serial console as before.
+
 4.7 DTB parsing
 
 bootargsinit (bootargs.c) walks the flattened device tree that VZ
@@ -484,13 +525,30 @@ actually exposes, and add a dumper before guessing a fourth time.
     (cosmetic).
   - rebootcode/reboot path untested under VZ (PSCI SYSTEM_RESET
     works for exit; warm reboot into a new kernel is unexplored).
-  - vgasize/console settings in -cmdline are passed through but
-    no display device exists; framebuffer support via
-    VZVirtioGraphicsDevice (virtio-gpu) plus devdraw/devmouse
-    would be a separate project.  The practical graphics path
-    today is service=cpu plus drawterm from the host over the
-    NAT subnet (rcpu/tcp17019, dp9ik); see NOTES for the
-    conversion recipe.
+  - Native graphics: DONE.  screen.c is a virtio-gpu driver that
+    implements the devdraw screen.c contract; #i/#m/swcursor are
+    in the vz config; USB keyboard/pointer are handled by nusb in
+    userspace.  Launch 9vz with -gui.  See section 4.9 below.
+    Remaining: hardware cursor (uses swcursor today).  Mode set:
+    screeninit now issues GET_DISPLAY_INFO as its first control-
+    queue round trip and, absent an explicit vgasize, adopts
+    scanout 0's host-preferred size; vgasize=WxHx32 still
+    overrides.  The service=cpu + drawterm-from-host path still
+    works and needs no display device.
+
+    BRING-UP NOTE (first -gui boot): the initial attempt printed
+    only "virtio-gpu: scanout setup failed" and then init died on
+    the downstream binds -- "#i: no frame buffer" and "#m: ... the
+    front fell off" (Egreg from mouseattach).  Both downstream
+    errors are CONSEQUENCES of the scanout failure: conf.monitor
+    is set 1 only after setup succeeds, so without it #i has no
+    gscreen and #m's attach errors.  Fixing the virtio-gpu bring-
+    up fixes all three.  screen.c now prints, per failing step,
+    the exact virtio-gpu response code (create-2d / attach-backing
+    / set-scanout / get-display-info, decoded by gpurespname), the
+    matched PCI device (%T did/rid), the scanout geometry, and
+    checks the FEATURES_OK handshake -- so the next boot localises
+    the failure instead of just saying "failed".
   - Higher cpu counts (>2) are plausible but unverified -- the
     code has no 2-cpu assumption, but only -cpus 2 has been
     exercised.  Use *gicdebug/*smpdebug if a higher count
@@ -513,6 +571,9 @@ actually exposes, and add a dumper before guessing a fourth time.
     clock.c      generic virtual timer, no PMU
     fpu.c        FP/SIMD context
     uartvz.c     virtio-console driver (two-phase, see 4.6)
+    screen.c     virtio-gpu framebuffer driver, devdraw screen.c
+                 contract, console-on-screen (see 4.9)
+    screen.h     devmouse/screen/swcursor prototypes
     bootargs.c   DTB parsing, plan9.ini-style config, cpu MPIDs
                  (cpumpid[]), GIC region (gicrbase/gicrsize)
     pciqemu.c    PCI ECAM config space access
