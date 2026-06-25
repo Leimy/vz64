@@ -402,9 +402,7 @@ clean (no kenter panic) and /dev/audio plays.  Live limitations:
     entitlement + TCC consent.
 
 Every control reply is still logged ("virtio-snd: ...", decoded by
-sndstatusname) for diagnostics.  Full plan, bring-up history, and the
-userspace playback recipes: /usr/dave/9vz-audio-and-fullscreen.md,
-section (c).
+sndstatusname) for diagnostics.
 
 4.7 DTB parsing
 
