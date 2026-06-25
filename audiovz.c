@@ -162,6 +162,19 @@ enum {
 	Period		= 4096,		/* bytes per xfer, frame-aligned */
 	Nperiod		= 8,		/* periods buffered in the ring */
 	Bufsize		= Period*Nperiod,
+
+	/*
+	 * Capture give-up cutoff.  When the host has no working input
+	 * stream (no mic entitlement / no TCC consent -- the common case)
+	 * EVERY rx period errors.  Without a cutoff capproc would re-post
+	 * failing periods forever, burning CPU and (before the one-shot
+	 * log flag) flooding /dev/kmesg.  After this many consecutive
+	 * failures with nothing captured, capproc gives up and tears the
+	 * capture stream down; a later read restarts it clean.
+	 */
+	Capmaxfail	= 32,
+	/* backoff between failing rx periods (ms) so a dead mic does not spin */
+	Capfailms	= 200,
 };
 
 typedef struct Vqueue Vqueue;
@@ -303,6 +316,8 @@ static struct {
 	int	capchmax;
 	int	capstarted;	/* capture START issued */
 	int	capready;	/* capture PCM lifecycle done; may read */
+	int	capstop;	/* read side closed: capproc should tear down */
+	int	caplogged;	/* rx-failure already logged once this session */
 	int	capfmt;
 	int	caprate;
 	int	capchans;
@@ -341,6 +356,8 @@ static int audiovzprobe(Audio *);
 static int sndactivate(void);
 static int pcmlifecycle(void);
 static int caplifecycle(void);
+static void capteardown(void);
+static int caprxready(void *);
 
 /*
  * Wire-format size assertions.  We send the W* byte counts (not
@@ -809,23 +826,33 @@ pcmsetparams(int sid, u64int fmts, u64int rates,
 	return -1;
 }
 
+/*
+ * Issue a simple PCM control command (PREPARE/START/STOP/RELEASE) for
+ * the given stream id.  Returns 0 on SOk, -1 otherwise.
+ */
 static int
-pcmsimple(int code)
+pcmsimpleid(int sid, int code)
 {
 	Sndpcmhdr h;
 	u32int t;
 
 	memset(&h, 0, sizeof h);
 	h.code = code;
-	h.stream_id = vsnd.streamid;
+	h.stream_id = sid;
 	/* wire sizes: request WSndpcmhdr (=8), reply a bare status header */
 	t = ctlcmd(&h, WSndpcmhdr, vsnd.resp, WSndhdr);
 	if(t != SOk){
-		print("virtio-snd: pcm cmd %#ux: %s (%#ux)\n",
-			code, sndstatusname(t), t);
+		print("virtio-snd: pcm cmd %#ux (stream %d): %s (%#ux)\n",
+			code, sid, sndstatusname(t), t);
 		return -1;
 	}
 	return 0;
+}
+
+static int
+pcmsimple(int code)
+{
+	return pcmsimpleid(vsnd.streamid, code);
 }
 
 /*
@@ -924,7 +951,25 @@ rxperiod(uchar *data, int len)
 	vout16(&q->notify, 0, Vrxq);
 	iunlock(&vsnd.il);
 
-	qwait(q);
+	/*
+	 * Wait for the device to fill this period, but stay responsive to
+	 * capstop (read side closed) and card teardown so a kill during a
+	 * never-completing rx period (dead mic) does not hang the kproc.
+	 * Like qwait, sleep on the completion interrupt when possible and
+	 * poll otherwise; caprxready also wakes on capstop/!present/failed.
+	 */
+	if(cansleep()){
+		while(!caprxready(q))
+			tsleep(&q->Rendez, caprxready, q, Capfailms);
+	} else {
+		while(!caprxready(q))
+			coherence();
+	}
+	if(!qhasroom(q)){
+		/* woke for capstop/teardown, not a completion */
+		return -1;
+	}
+	q->lastused = q->used->idx;
 
 	if(vsnd.rxstat.status != SOk)
 		return -1;
@@ -1076,23 +1121,87 @@ drainproc(void *)
 
 /*
  * Predicate for a blocked reader (audiovzread): the capture ring has
- * data to read, OR the card is gone so the reader should give up.
+ * data to read, OR the card is gone, OR capture has stopped/given up
+ * (capstop set, or the capture kproc is no longer running and capture
+ * is not ready) so the reader should give up rather than hang.
  */
 static int
 indata(void *)
 {
-	return buffered(&vsnd.inring) > 0 || !vsnd.present || vsnd.failed;
+	return buffered(&vsnd.inring) > 0 || !vsnd.present || vsnd.failed
+		|| vsnd.capstop || (!vsnd.capready && !vsnd.ckproc);
+}
+
+/*
+ * Predicate for the capture kproc: an rx period completed, OR the read
+ * side asked us to stop, OR the card went away.  capproc sleeps on this
+ * (via the rx Rendez) instead of spinning, so a dead-mic failure path
+ * backs off rather than busy-looping.
+ */
+static int
+caprxready(void *)
+{
+	return qhasroom(&vsnd.rx) || vsnd.capstop || !vsnd.present || vsnd.failed;
+}
+
+/*
+ * Quiesce the capture stream and reset capture state so a later read
+ * can restart it from scratch.  Runs on the capture kproc's KSTACK as
+ * it exits (or after a give-up).  Best-effort: STOP+RELEASE the capture
+ * stream, drop any stale rx completions, reset the capture ring, and
+ * clear the per-session flags (capstarted/capready/capstop/caplogged)
+ * and ckproc so audiovzcapstart() will spawn a fresh kproc next time.
+ */
+static void
+capteardown(void)
+{
+	if(vsnd.capstarted){
+		qlock(&vsnd.ctll);
+		pcmsimpleid(vsnd.capstreamid, RPcmStop);
+		pcmsimpleid(vsnd.capstreamid, RPcmRelease);
+		qunlock(&vsnd.ctll);
+	}
+
+	/* drop any rx completions the device may still post */
+	vsnd.rx.lastused = vsnd.rx.used->idx;
+
+	/* reset the capture ring so stale PCM is not read next session */
+	vsnd.inring.ri = vsnd.inring.wi = 0;
+
+	vsnd.capstarted = 0;
+	vsnd.capready = 0;
+	vsnd.capstop = 0;
+	vsnd.caplogged = 0;
+	vsnd.ckproc = 0;
+
+	/* wake any reader still blocked so it returns short */
+	wakeup(&vsnd.inring.r);
 }
 
 /*
  * Capture kproc: post empty periods on rxq, wait for the device to
  * fill them, and copy the captured PCM into the inring for userspace.
- * Mirror image of drainproc for the tx path.
+ * Mirror image of drainproc for the tx path -- but the capture path
+ * must survive the common case of a host with NO working input stream
+ * (no mic entitlement / no TCC consent), where every rx period errors.
+ *
+ * To avoid the old failure storm (which re-posted each failed period
+ * instantly, spun the CPU, and flooded /dev/kmesg with "rx period
+ * failed"), this loop:
+ *   - sleeps on the rx Rendez (caprxready) rather than spinning;
+ *   - logs the FIRST failure of the session ONCE (caplogged), never the
+ *     rest, regardless of any intervening OK periods;
+ *   - backs off Capfailms on a failing period instead of re-posting at
+ *     line rate;
+ *   - gives up after Capmaxfail consecutive failures with nothing
+ *     captured, tearing the capture stream down (a later read restarts);
+ *   - exits promptly when the read side closes (capstop) or the card
+ *     goes away.
  */
 static void
 capproc(void *)
 {
-	int n;
+	int n, nfail;
 
 	while(waserror())
 		;
@@ -1105,22 +1214,44 @@ capproc(void *)
 	 */
 	if(caplifecycle() < 0){
 		print("virtio-snd: capture lifecycle failed; no mic\n");
+		capteardown();
 		pexit("audiovz capture failed", 1);
 	}
 
+	nfail = 0;
 	for(;;){
-		if(!vsnd.capready)
+		if(!vsnd.capready || vsnd.capstop || !vsnd.present || vsnd.failed)
 			break;
 
 		n = rxperiod(vsnd.rxbuf, Period);
 		if(n <= 0){
-			print("virtio-snd: rx period failed\n");
+			/*
+			 * Persistent rx failure is the no-working-mic case.
+			 * Log once per session, back off so we do not spin,
+			 * and give up after Capmaxfail in a row.
+			 */
+			if(!vsnd.caplogged){
+				print("virtio-snd: rx period failed "
+					"(no working host input?); "
+					"backing off\n");
+				vsnd.caplogged = 1;
+			}
+			if(++nfail >= Capmaxfail){
+				print("virtio-snd: capture gave up after %d "
+					"failures; close and re-open to retry\n",
+					nfail);
+				break;
+			}
+			tsleep(&vsnd.ckr, return0, nil, Capfailms);
 			continue;
 		}
+		nfail = 0;
 
 		writering(&vsnd.inring, vsnd.rxbuf, n);
 		wakeup(&vsnd.inring.r);
 	}
+
+	capteardown();
 	pexit("audiovz capture exiting", 1);
 }
 
@@ -1283,7 +1414,22 @@ audiovzclose(Audio *, int mode)
 				break;
 		wakeup(&vsnd.kr);
 	}
-	/* capture side: nothing special to do on read close */
+
+	if(mode == OREAD || mode == ORDWR){
+		/*
+		 * Read side closed (e.g. `cat /dev/audio` was killed).  Tell
+		 * the capture kproc to stop and tear down: set capstop and
+		 * wake it (on the rx Rendez and its own ckr) plus any reader
+		 * still blocked in audiovzread.  Without this the capture
+		 * kproc would loop forever -- the failure-storm bug.
+		 */
+		if(vsnd.ckproc){
+			vsnd.capstop = 1;
+			wakeup(&vsnd.rx);
+			wakeup(&vsnd.ckr);
+			wakeup(&vsnd.inring.r);
+		}
+	}
 }
 
 /*
