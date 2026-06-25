@@ -6,8 +6,8 @@ Apple's Virtualization.framework (VZ) on Apple silicon Macs, via
 VZLinuxBootLoader -- no firmware, no U-Boot, no emulated legacy
 hardware.  It boots to an interactive rc prompt on an hjfs root
 filesystem over virtio-blk, with working virtio console, GICv3
-interrupts, ARM virtual timer, virtio networking, and SMP (multi-
-cpu), and supports graphical use via drawterm from the host.
+interrupts, ARM virtual timer, virtio networking, SMP (multi-cpu),
+native virtio-gpu graphics, and virtio-sound audio playback.
 
 This port was generated with Claude Opus (Anthropic) and Fable,
 working with a human who ran every build and boot.  The kernel
@@ -146,6 +146,66 @@ listen1 setup; the Mac reaches the guest's DHCP address directly
 on Apple NAT bridge100, note 192.168.64.1 is the HOST) -- still
 works and needs no display device.
 
+Audio
+-----
+Audio (playback) works via a virtio-sound device.  Launch the host
+runner with -audio (9vz -audio ...); it attaches a virtio-sound
+device (PCI 1AF4:1059) with a host speaker output stream.  The
+kernel side is:
+
+  * audiovz.c  a virtio-sound driver that registers an audio(3)
+               card with devaudio.c (addaudiocard), so the guest
+               gets the standard #A interface: /dev/audio (write
+               PCM to play), /dev/volume, /dev/audioctl,
+               /dev/audiostat.  PLAYBACK ONLY for now.
+  * #A (audio) is in the vz config; audiovz is in the link section.
+
+The virtio 1.0 handshake (PCI cap walk, feature negotiation -- only
+VIRTIO_F_VERSION_1, control word 0 driven to zero -- queue setup,
+the sleep-on-used-ring completion discipline) is the same pattern as
+screen.c and uartvz.c.  The PCM lifecycle is run at probe time:
+PCM_INFO (enumerate, pick the first OUTPUT stream) -> SET_PARAMS ->
+PREPARE; START is deferred to the first period actually written.
+SET_PARAMS probes a most-likely-first candidate list (S16_LE/48000
+then /44100, stereo) the way screen.c's gpucreate2d() probes pixel
+formats, since Apple's backend is pickier than QEMU's.  Data flows
+through a userspace ring (the audioac97.c Ring bookkeeping); a kproc
+drains it onto the tx virtqueue, one xfer header + PCM + status
+chain per period, waiting on the used ring for completion.
+
+Because the devaudio reset hook runs on the tiny boot stack before
+the scheduler (up == nil) -- where bringing the virtio device live, or
+creating a kproc, panics -- the probe does ONLY PCI discovery and
+registers the card as present; the whole virtio handshake + PCM
+lifecycle + draining run in a kproc created lazily on the first
+/dev/audio write.  A companion fix in pciqemu.c masks each PCI slot's
+GIC SPI until a real driver claims it, so no driverless device can
+interrupt on the boot stack.
+
+Play audio from userspace with the standard /sys/src/cmd/audio tools
+(they all emit 16-bit LE stereo PCM to /dev/audio): mp3dec, oggdec,
+flacdec, wavdec.  Internet radio works via zuke (audio/mkplist URL |
+audio/zuke) or by hand (hget URL | audio/mp3dec | audio/pcmconv -o
+s16c2r48000 >/dev/audio).
+
+If 9vz is run without -audio there is no virtio-sound device;
+the probe finds nothing and #A has no card (the serial console and
+everything else still work) -- exactly like screen.c staying
+headless without -gui.
+
+STATUS: PLAYBACK WORKS -- confirmed audible on hardware.  Known
+limitations: (1) audio is choppy on jittery network sources because
+the tx path posts one ~21ms period and blocks on completion before
+refilling (the fix is txq pipelining + a deeper ring); (2) there is
+nothing to write to /dev/audioctl (returns Egreg) and /dev/volume is
+a 100%-master no-op, since Apple exposes no guest mixer -- do
+volume/quality in userspace (mixfs/zuke; pcmconv to the native
+48000Hz); output is fixed at 48000Hz/S16/2ch.  Capture (microphone,
+the rx virtqueue) is not implemented -- /dev/audio is write-only --
+and is the next step.  See the working notes
+(/usr/dave/9vz-audio-and-fullscreen.md, section (c)) for the pipelining
+fix, the capture plan, and the userspace playback recipes.
+
 Done since first bring-up
 -------------------------
   * SMP.  Verified: a 2-cpu guest boots to the rc prompt with
@@ -164,6 +224,14 @@ Done since first bring-up
 
 TODO
 ----
+  * audiovz: playback works.  Next, txq pipelining (post several
+    periods + deepen the ring) to fix the choppiness on jittery
+    network sources -- the tx path currently posts one ~21ms period
+    and blocks on completion before refilling.  Then add capture (the
+    rx virtqueue) so /dev/audio reads work -- needed for the voice
+    pipeline.  /dev/audioctl/-volume controls are unwired (Apple
+    exposes no mixer); volume/quality is done in userspace.  See
+    /usr/dave/9vz-audio-and-fullscreen.md section (c).
   * virtio-gpu hardware cursor (currently swcursor).
   * virtio-gpu RESIZE / multi-scanout (VZ exposes one scanout;
     the host -width/-height set it; guest-driven mode set via
@@ -187,6 +255,7 @@ Files
     uartvz.c     virtio-console driver
     screen.c     virtio-gpu framebuffer (devdraw screen.c contract)
     screen.h     devmouse/screen/swcursor prototypes
+    audiovz.c    virtio-sound driver (audio(3) #A; playback only)
     bootargs.c   DTB / plan9.ini-style config
     pciqemu.c    PCI ECAM access
     sysreg.c devrtc.c             sysreg helpers, PL031 RTC

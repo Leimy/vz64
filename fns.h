@@ -121,6 +121,10 @@ extern void intrdisable(int, void (*)(Ureg*, void*), void*, int, char*);
 extern int irq(Ureg*);
 extern void fiq(Ureg*);
 extern void dumprregs(void);
+extern void gicspimask(int intid, int mask);
+extern int gicspienabled(int intid);
+extern u32int giclastintid;
+extern u32int giccurhppir(void);
 
 /* sysreg */
 extern uvlong	sysrd(ulong);

@@ -14,6 +14,8 @@
 
 Conf conf;
 
+extern ulong kerndate;	/* KERNDATE, set at link time in vz.c */
+
 int
 isaconfig(char *, int, ISAConf *)
 {
@@ -236,6 +238,18 @@ main(uintptr dtb)
 	xinit();
 	printinit();
 	print("\nPlan 9\n");
+	/*
+	 * Build stamp.  kerndate is KERNDATE, the Unix timestamp passed
+	 * by the mkfile (-DKERNDATE=`{date -n}) at every link, so it
+	 * uniquely identifies THIS binary.  Printing it this early (right
+	 * after the banner, before any device probe or panic) means every
+	 * boot transcript -- including a panic -- carries proof of which
+	 * 9vz.bin actually booted.  If a pasted panic shows a kerndate
+	 * older than the one `mk` just produced, an old kernel was booted
+	 * and the panic is stale.  (date -tu/seconds(2) converts the
+	 * number to a readable time after the fact.)
+	 */
+	print("vz64 kernel build: kerndate %lud\n", kerndate);
 	trapinit();
 	fpuinit();
 	intrinit();

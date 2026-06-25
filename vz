@@ -22,6 +22,7 @@ dev
 	rtc
 	pci	pci
 	sd
+	audio
 
 link
 	usbxhcipci	pci usbxhci
@@ -32,6 +33,7 @@ link
 	netdevmedium
 	pciqemu		pci
 	uartvz		pci virtio10mem
+	audiovz		pci virtio10mem
 
 ip
 	tcp

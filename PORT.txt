@@ -227,9 +227,12 @@ All I/O is virtio 1.0 ("modern") on a PCI ECAM:
     ethervirtio10   virtio-net
     sdvirtio10      virtio-blk (SCSI-flavored sd)
     usbxhcipci      XHCI (if VZ exposes one)
+    screen.c        virtio-gpu (with 9vz -gui; see 4.9)
+    audiovz.c       virtio-sound (with 9vz -audio; see 4.10)
 
 pciqemu.c provides ECAM config access.  Device discovery is by
-vendor:device ID match (console is 0x1AF4:0x1043).
+vendor:device ID match (console is 0x1AF4:0x1043, gpu 0x1AF4:0x1050,
+sound 0x1AF4:0x1059).
 
 4.6 The console (uartvz.c)
 
@@ -298,6 +301,111 @@ If no virtio-gpu device is present (9vz without -gui), gpuprobe()
 finds nothing, screeninit() returns quietly, and the kernel runs
 headless on the serial console as before.
 
+4.10 Audio (audiovz.c)
+
+VZ's -audio mode (in the 9vz host runner) attaches a
+VZVirtioSoundDevice with a host speaker output stream (and, with
+-mic, a host microphone input stream).  The guest needs a driver.
+
+audiovz.c is the virtio-sound driver.  virtio-sound (PCI
+0x1AF4:0x1059 -- virtio device id 25, modern PCI did 0x1040+25) is a
+virtio 1.0 device with four queues: controlq (0), eventq (1), txq
+(2, playback), rxq (3, capture).  The driver currently implements
+PLAYBACK ONLY, using controlq and txq; eventq and rxq are left
+unconfigured.
+
+It does not implement the audio(3) filesystem itself: it registers
+an Audio card with the portable devaudio.c via addaudiocard(), so
+the guest gets the standard #A interface (/dev/audio, /dev/volume,
+/dev/audioctl, /dev/audiostat) and devaudio owns the FS and the
+volume-string parsing.  This is the same split the x86 audioac97.c
+driver uses; audioac97.c was the model for the userspace-facing ring
+buffer (Ring / readring / writering / buffered), while screen.c and
+uartvz.c were the model for the virtio side.
+
+Bring-up, like the console and the GPU, is deferred until PCI is up:
+the probe runs from audioreset (devaudio's reset, via chandevreset)
+rather than from main().  It:
+
+  * probes the device, negotiates VERSION_1 (control feature word 0
+    driven to zero -- no optional sound features), sets up controlq
+    and txq (same vring code as uartvz.c / screen.c), DRIVER_OK;
+  * runs the PCM control lifecycle: PCM_INFO (enumerate streams,
+    pick the first OUTPUT one) -> SET_PARAMS -> PREPARE.  START is
+    deferred to the first period actually written, so an idle
+    /dev/audio does not run a hungry stream;
+  * SET_PARAMS probes a most-likely-first candidate list
+    (S16_LE/48000, then /44100; stereo) the way screen.c's
+    gpucreate2d() probes pixel formats -- Apple's virtio-sound
+    backend is expected to be pickier than QEMU's, and this is the
+    one genuine bring-up unknown (see below);
+  * allocates a page-aligned userspace ring; a kproc (drainproc)
+    pulls period-sized chunks (4096 B) and posts each as a txq
+    descriptor chain: xfer header (stream id) -> PCM data -> status
+    word, then waits on the used ring.  write() fills the ring and
+    wakes the kproc; close() pads the final partial period.
+
+Completion discipline is screen.c's: sleep on the used-ring
+completion interrupt when in process context at spllo, poll during
+early bring-up, never force interrupts off across a host round trip
+(the throughput lesson from the GPU flush path, NOTES "GUI Bug 4").
+
+/dev/volume is a 100%-master no-op stub: Apple's backend exposes no
+guest mixer controls.
+
+BOOT-STACK CONSTRAINT (this is why the driver is structured oddly --
+read this before touching it): the devaudio reset hook (audiovzprobe,
+via chandevreset) runs on the tiny per-Mach boot stack with up == nil,
+BEFORE schedinit.  Bringing the virtio device live there (DRIVER_OK +
+bus master) lets it raise an interrupt that nests trap frames on the
+boot stack until kenter() panics; creating a kproc there is itself a
+trap source.  So the probe does ONLY pure PCI discovery (sndfind) and
+registers the card as PRESENT.  The ENTIRE lifecycle -- virtio
+handshake AND PCM_INFO/SET_PARAMS/PREPARE AND draining -- runs in a
+kproc (drainproc) created LAZILY on the first /dev/audio write
+(audiovzstart, from audiovzwrite), where up != nil after schedinit on
+a real KSTACK.  Plus a companion vz64 PORT fix in pciqemu.c: each PCI
+slot's GIC SPI is masked until a real driver claims it (pciintrenable),
+so no driverless device can interrupt on the boot stack.  See the vz64
+PORT NOTES (section (e) of the working notes) for the full diagnosis.
+
+If no virtio-sound device is present (9vz without -audio), the probe
+finds nothing and #A has no card; everything else runs as before --
+exactly like screen.c staying headless without -gui.
+
+STATUS: PLAYBACK WORKS -- confirmed audible on hardware.  PCM_INFO,
+SET_PARAMS and PREPARE all succeed; the lazy-kproc activation boots
+clean (no kenter panic) and /dev/audio plays.  Live limitations:
+
+  * CHOPPY on jittery network sources.  drainproc posts ONE ~4096-byte
+    period (1024 frames, ~21ms at 48kHz) and BLOCKS on its completion
+    before refilling, so a late ring refill (e.g. internet radio over
+    the network) underruns and is heard as a gap.  The fix (anticipated
+    by the "one in-flight tx period ... can pipeline later" design note)
+    is to pipeline several periods on the txq and reap multiple
+    completions per wakeup, and/or deepen the ring (Nperiod, currently
+    8 = ~170ms).  SomaFM (stable Icecast) is noticeably smoother than
+    flakier streams, but the residual gap is the driver's, not the
+    source's.  NOT yet done.
+  * NO /dev/audioctl OR /dev/volume CONTROLS.  The driver never sets
+    adev->ctl, so any write to /dev/audioctl returns Egreg.  /dev/volume
+    is a single 100%-master no-op (Apple exposes no guest mixer; volset
+    ignores writes, and only "master" is in voltab).  Output is fixed at
+    48000Hz/S16/2ch -- Apple also advertises S32/FLOAT and 96000Hz but
+    none of that helps a 44.1kHz radio source.  Volume/quality tuning is
+    a userspace concern: mixfs "mix" / zuke for volume, pcmconv -o
+    s16c2r48000 to resample the source once to the native rate.
+  * CAPTURE (rxq / microphone) is NOT implemented -- /dev/audio is
+    write-only.  It is symmetric to playback (pre-post empty buffers on
+    rxq, wait on completion, set adev->read) and is the next step; it is
+    what the voice pipeline needs.  Host side also needs the mic
+    entitlement + TCC consent.
+
+Every control reply is still logged ("virtio-snd: ...", decoded by
+sndstatusname) for diagnostics.  Full plan, bring-up history, and the
+userspace playback recipes: /usr/dave/9vz-audio-and-fullscreen.md,
+section (c).
+
 4.7 DTB parsing
 
 bootargsinit (bootargs.c) walks the flattened device tree that VZ
@@ -327,6 +435,9 @@ The 9vz Go program (Code-Hex/vz bindings) configures:
     virtio-net               NAT, random locally-administered MAC
     virtio-entropy
     virtio-vsock             (for a future 9P control plane)
+    virtio-gpu + USB kbd/ptr (with -gui; see 4.9)
+    virtio-sound             (with -audio: host speaker output;
+                              with -mic: also host mic input; see 4.10)
     -cpus N (default 2), -mem GiB (default 2)
 
 Also supports -efi for EFI firmware boot as a fallback path.
@@ -549,6 +660,26 @@ actually exposes, and add a dumper before guessing a fourth time.
     matched PCI device (%T did/rid), the scanout geometry, and
     checks the FEATURES_OK handshake -- so the next boot localises
     the failure instead of just saying "failed".
+  - Audio: PLAYBACK WORKS (confirmed audible on hardware).  audiovz.c
+    presents the audio(3) #A interface via devaudio.c; the host wiring
+    exists (9vz -audio / -mic).  PCM_INFO/SET_PARAMS/PREPARE succeed and
+    the lazy-kproc activation boots clean.  Remaining work, in order of
+    leverage:
+      * txq PIPELINING -- the live limitation.  drainproc posts ONE
+        ~21ms period and blocks on completion before refilling, so a
+        late ring refill (jittery network radio) underruns and the
+        audio is choppy.  Pipeline several periods on the txq + deepen
+        the ring (Nperiod).  This is the one fix that addresses the
+        choppiness at the root rather than working around it.
+      * CAPTURE (rxq / microphone) -- not implemented; /dev/audio is
+        write-only.  Symmetric to playback; what the voice pipeline
+        needs.  Host side also needs the mic entitlement + TCC consent.
+      * (optional) wire adev->ctl / a real voltab if guest-side
+        speed/volume control is ever wanted -- today /dev/audioctl
+        returns Egreg and /dev/volume is a no-op (Apple exposes no
+        mixer); volume/quality is done in userspace (mixfs/zuke/pcmconv).
+    See section 4.10 and /usr/dave/9vz-audio-and-fullscreen.md
+    section (c).
   - Higher cpu counts (>2) are plausible but unverified -- the
     code has no 2-cpu assumption, but only -cpus 2 has been
     exercised.  Use *gicdebug/*smpdebug if a higher count
@@ -574,6 +705,8 @@ actually exposes, and add a dumper before guessing a fourth time.
     screen.c     virtio-gpu framebuffer driver, devdraw screen.c
                  contract, console-on-screen (see 4.9)
     screen.h     devmouse/screen/swcursor prototypes
+    audiovz.c    virtio-sound driver, audio(3) #A card via
+                 devaudio.c, playback only (see 4.10)
     bootargs.c   DTB parsing, plan9.ini-style config, cpu MPIDs
                  (cpumpid[]), GIC region (gicrbase/gicrsize)
     pciqemu.c    PCI ECAM config space access

@@ -94,6 +94,35 @@ static Vctl *vctl[MAXMACH][32], *vfiq;
 static u32int *dregs = (u32int*)VIRTIO;
 
 /*
+ * Diagnostic: the intid of the most recent IRQ taken (any cpu).  Read
+ * by the audio boot-stack probe to PROVE which interrupt is nesting on
+ * the boot stack, instead of guessing it is the slot's INTx SPI.  If a
+ * panic happens with the slot's SPI masked but this shows a different
+ * intid (e.g. an LPI from MSI-X, or another slot's SPI), the mask is on
+ * the wrong source -- which is exactly the branch the bring-up notes
+ * keep deferring.
+ */
+u32int giclastintid = ~0;
+
+/*
+ * Diagnostic readback of the highest-priority pending group-1
+ * interrupt id, WITHOUT acknowledging it (ICC_HPPIR1_EL1 is a pure
+ * read; unlike IAR it does not activate the interrupt).  giclastintid
+ * is only updated by irq() AFTER the IRQ is taken, so on a kenter()
+ * stack-overflow panic that fires the instant the trap is entered (in
+ * splflo()/kenter, before irq() runs) it can be stale.  Reading HPPIR
+ * in the panic path names the interrupt that is actually pending right
+ * now -- so we can tell whether the storm is the slot SPI (intl 72),
+ * some other SPI, an LPI from MSI-X (id >= 8192), or not an IRQ at all
+ * (1023 = no pending interrupt).
+ */
+u32int
+giccurhppir(void)
+{
+	return sysrd(ICC_HPPIR1_EL1) & 0xFFFFFF;
+}
+
+/*
  * Pack an MPIDR_EL1 value into the 32-bit affinity layout used by
  * GICR_TYPER[63:32] (Aff3<<24 | Aff2<<16 | Aff1<<8 | Aff0).  MPIDR
  * keeps Aff3 up at bits [39:32]; the GIC affinity word keeps it at
@@ -405,6 +434,7 @@ irq(Ureg* ureg)
 	m->intr++;
 	intid = sysrd(ICC_IAR1_EL1) & 0xFFFFFF;
 // iprint("i<%d>", intid);
+	giclastintid = intid;		/* diagnostic: last IRQ taken on this cpu */
 	if((intid & ~3) == 1020)
 		return 0; // spurious
 	clockintr = 0;
@@ -514,4 +544,45 @@ intrdisable(int, void (*f)(Ureg*, void*), void *a, int tbdf, char*)
 		pciintrdisable(tbdf, f, a);
 		return;
 	}
+}
+
+/*
+ * Mask (mask!=0) or unmask (mask==0) a single SPI at the GIC
+ * distributor, by clearing/setting its GICD_ISENABLER bit.  This is
+ * the hard, device-independent gate used during the audio boot-stack
+ * probe: with the slot's SPI cleared in the distributor the CPU
+ * cannot take that interrupt no matter what the device asserts (legacy
+ * INTx or otherwise), so nothing can be delivered and nested on the
+ * tiny per-Mach boot stack while chandevreset() drives a chatty device
+ * with up == nil.  Only valid for SPIs (intid >= 32); PPI/SGI live in
+ * the redistributor and are not handled here.  The driver re-enables
+ * the line from a kproc once it is on a real KSTACK at spllo.
+ */
+void
+gicspimask(int intid, int mask)
+{
+	if(intid < 32)
+		return;
+	if(mask)
+		dregs[GICD_ICENABLER0 + (intid/32)] = 1 << (intid%32);
+	else
+		dregs[GICD_ISENABLER0 + (intid/32)] = 1 << (intid%32);
+	coherence();
+	while(dregs[GICD_CTLR]&(1<<31))
+		;
+}
+
+/*
+ * Diagnostic readback: is this SPI's distributor enable bit currently
+ * SET (1) or clear (0)?  After gicspimask(intid,1) this should read 0;
+ * if it reads 1, VZ's distributor did not honour the clear and masking
+ * at the distributor is not actually gating the line -- prove it rather
+ * than infer it across several boots.  Returns -1 for non-SPIs.
+ */
+int
+gicspienabled(int intid)
+{
+	if(intid < 32)
+		return -1;
+	return (dregs[GICD_ISENABLER0 + (intid/32)] >> (intid%32)) & 1;
 }
