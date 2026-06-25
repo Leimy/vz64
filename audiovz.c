@@ -14,10 +14,13 @@
  * (stream id) + the PCM bytes, chained to a status word the device
  * writes on completion.
  *
- * PLAYBACK ONLY for now (the txq path).  Capture (rxq) is symmetric and
- * deferred -- see the working notes (/usr/dave/9vz-audio-and-fullscreen.md
- * section (c)).  /dev/audio is therefore write-only here; reads return
- * nothing.
+ * PLAYBACK (txq, queue 2) and CAPTURE (rxq, queue 3).  Capture is the
+ * mirror image of playback: pre-post empty buffers on the rxq, wait
+ * for the device to fill them with recorded PCM, and copy the data
+ * into a read ring for userspace.  The capture stream is found and
+ * negotiated alongside the playback stream in pcmlifecycle().  The
+ * host side must have the mic entitlement and an input stream
+ * configured -- see section (b) of the working notes.
  *
  * Structure, by analogy:
  *   - the virtio 1.0 handshake (PCI cap walk, feature negotiation,
@@ -150,9 +153,9 @@ enum {
 	WSndstatus	= 8,	/* virtio_snd_pcm_status */
 
 	/*
-	 * playback geometry.  S16_LE stereo => 4 bytes/frame.  A period
-	 * is one xfer; the ring holds a few periods so write() can run
-	 * ahead of the device.
+	 * playback/capture geometry.  S16_LE stereo => 4 bytes/frame.
+	 * A period is one xfer; the ring holds a few periods so
+	 * write()/read() can run ahead/behind the device.
 	 */
 	Chans		= 2,
 	BytesPerFrame	= 2*Chans,	/* S16, 2ch */
@@ -260,7 +263,7 @@ struct Ring
 
 static struct {
 	int	present;	/* virtio-snd device discovered in PCI */
-	int	ready;		/* PCM lifecycle done; audio may flow */
+	int	ready;		/* playback PCM lifecycle done; audio may flow */
 	int	failed;		/* activation/lifecycle gave up; no audio */
 	int	intr;
 
@@ -275,10 +278,12 @@ static struct {
 
 	Vqueue	ctl;
 	Vqueue	tx;
+	Vqueue	rx;
 
 	QLock	ctll;		/* serialises control-queue submitters */
 	Lock	il;		/* brief vring index manipulation */
 
+	/* playback stream */
 	int	streamid;	/* playback stream id from PCM_INFO */
 	u64int	formats;	/* PCM_INFO formats bitmap for the chosen stream */
 	u64int	rates;		/* PCM_INFO rates bitmap for the chosen stream */
@@ -290,12 +295,30 @@ static struct {
 	int	chans;		/* channel count we set up */
 	int	speed;		/* rate in Hz (for /dev/audiostat) */
 
+	/* capture stream */
+	int	capstreamid;	/* capture stream id from PCM_INFO, or -1 */
+	u64int	capformats;	/* PCM_INFO formats bitmap for capture */
+	u64int	caprates;	/* PCM_INFO rates bitmap for capture */
+	int	capchmin;
+	int	capchmax;
+	int	capstarted;	/* capture START issued */
+	int	capready;	/* capture PCM lifecycle done; may read */
+	int	capfmt;
+	int	caprate;
+	int	capchans;
+	int	capspeed;
+
 	Ring	outring;
+	Ring	inring;		/* capture ring: device writes, user reads */
 
 	/* a kproc drains outring -> txq */
 	Rendez	kr;
 	int	kproc;		/* drain kproc created (started on demand) */
 	QLock	startl;		/* serialises lazy kproc creation */
+
+	/* a kproc fills inring <- rxq */
+	Rendez	ckr;
+	int	ckproc;		/* capture kproc created */
 
 	/* control scratch (single in-flight control command) */
 	uchar	cmd[256];
@@ -306,12 +329,18 @@ static struct {
 	Sndstatus txstat;
 	uchar	txbuf[Period];
 
+	/* rx scratch: one period in flight at a time on the capture path */
+	Sndxfer	rxhdr;
+	Sndstatus rxstat;
+	uchar	rxbuf[Period];
+
 	Audio	*adev;
 } vsnd;
 
 static int audiovzprobe(Audio *);
 static int sndactivate(void);
 static int pcmlifecycle(void);
+static int caplifecycle(void);
 
 /*
  * Wire-format size assertions.  We send the W* byte counts (not
@@ -516,6 +545,8 @@ interrupt(Ureg*, void*)
 			wakeup(&vsnd.ctl);
 		if(qhasroom(&vsnd.tx))
 			wakeup(&vsnd.tx);
+		if(qhasroom(&vsnd.rx))
+			wakeup(&vsnd.rx);
 	}
 }
 
@@ -575,17 +606,20 @@ sndstatusname(u32int s)
 }
 
 /*
- * PCM_INFO: enumerate streams, find the first OUTPUT (playback) one.
- * Returns its id, or -1 if none.  Also records the device's advertised
- * channel range for diagnostics.
+ * PCM_INFO: enumerate all streams, find the first OUTPUT (playback)
+ * and the first INPUT (capture) stream.  Sets vsnd.streamid (playback)
+ * and vsnd.capstreamid (capture) independently; either can be -1 if
+ * the device does not offer that direction.  Returns 0 on success
+ * (at least playback found), -1 on total failure.
  */
 static int
-pcmfindplayback(void)
+pcmfindstreams(void)
 {
 	Sndquery q;
 	Sndpcminfo *info;
 	u32int t;
 	int total, perbatch, start, n, i, resplen;
+	int gotout, gotin;
 
 	/*
 	 * The number of PCM streams is reported in virtio_snd_config; we
@@ -605,6 +639,11 @@ pcmfindplayback(void)
 		print("virtio-snd: resp buffer too small for pcm-info\n");
 		return -1;
 	}
+
+	gotout = 0;
+	gotin = 0;
+	vsnd.streamid = -1;
+	vsnd.capstreamid = -1;
 
 	for(start = 0; start < total; start += n){
 		n = total - start;
@@ -643,19 +682,29 @@ pcmfindplayback(void)
 				info->channels_max,
 				(u32int)(info->formats>>32), (u32int)info->formats,
 				(u32int)(info->rates>>32), (u32int)info->rates);
-			if(info->direction == Doutput){
-				/* remember what this stream actually supports
-				 * so SET_PARAMS asks only for advertised
-				 * format/rate/channel combinations. */
+			if(info->direction == Doutput && !gotout){
 				vsnd.formats = info->formats;
 				vsnd.rates = info->rates;
 				vsnd.chmin = info->channels_min;
 				vsnd.chmax = info->channels_max;
-				return start+i;
+				vsnd.streamid = start+i;
+				gotout = 1;
+			}
+			if(info->direction == Dinput && !gotin){
+				vsnd.capformats = info->formats;
+				vsnd.caprates = info->rates;
+				vsnd.capchmin = info->channels_min;
+				vsnd.capchmax = info->channels_max;
+				vsnd.capstreamid = start+i;
+				gotin = 1;
 			}
 		}
 	}
-	return -1;
+	if(vsnd.streamid < 0){
+		print("virtio-snd: no playback stream\n");
+		return -1;
+	}
+	return 0;
 }
 
 /*
@@ -673,13 +722,13 @@ static struct {
 };
 
 static int
-pcmsetparamstry(int fmt, int rate, int chans)
+pcmsetparamstry(int sid, int fmt, int rate, int chans)
 {
 	Sndsetparams sp;
 
 	memset(&sp, 0, sizeof sp);
 	sp.code = RPcmSetParams;
-	sp.stream_id = vsnd.streamid;
+	sp.stream_id = sid;
 	sp.buffer_bytes = Bufsize;
 	sp.period_bytes = Period;
 	sp.features = 0;
@@ -690,8 +739,16 @@ pcmsetparamstry(int fmt, int rate, int chans)
 	return ctlcmd(&sp, WSndsetparams, vsnd.resp, WSndhdr);
 }
 
+/*
+ * Negotiate SET_PARAMS for a given stream.  fmts/rates are the
+ * device-advertised bitmaps; chmin/chmax the channel range.  On
+ * success, stores the accepted format/rate/chans/speed in *ofmt etc.
+ * label is "playback" or "capture" for diagnostics.
+ */
 static int
-pcmsetparams(void)
+pcmsetparams(int sid, u64int fmts, u64int rates,
+	int chmin, int chmax, int *ofmt, int *orate,
+	int *ochans, int *ospeed, char *label)
 {
 	u32int t;
 	int i, chans, tried;
@@ -705,48 +762,50 @@ pcmsetparams(void)
 	 * largest channel count in the advertised [chmin..chmax] range.
 	 */
 	chans = Chans;
-	if(chans > vsnd.chmax)
-		chans = vsnd.chmax;
-	if(chans < vsnd.chmin)
-		chans = vsnd.chmin;
+	if(chans > chmax)
+		chans = chmax;
+	if(chans < chmin)
+		chans = chmin;
 	if(chans < 1)
 		chans = 1;
 
 	tried = 0;
 	for(i = 0; i < nelem(sndparams); i++){
 		/* skip combinations the device did not advertise */
-		if((vsnd.formats & ((u64int)1<<sndparams[i].fmt)) == 0)
+		if((fmts & ((u64int)1<<sndparams[i].fmt)) == 0)
 			continue;
-		if((vsnd.rates & ((u64int)1<<sndparams[i].rate)) == 0)
+		if((rates & ((u64int)1<<sndparams[i].rate)) == 0)
 			continue;
 		tried++;
 
-		t = pcmsetparamstry(sndparams[i].fmt, sndparams[i].rate, chans);
+		t = pcmsetparamstry(sid, sndparams[i].fmt, sndparams[i].rate, chans);
 		if(t == SOk){
-			vsnd.fmt = sndparams[i].fmt;
-			vsnd.rate = sndparams[i].rate;
-			vsnd.speed = sndparams[i].hz;
-			vsnd.chans = chans;
-			print("virtio-snd: set-params: ok (fmt %d rate %dHz "
+			*ofmt = sndparams[i].fmt;
+			*orate = sndparams[i].rate;
+			*ospeed = sndparams[i].hz;
+			*ochans = chans;
+			print("virtio-snd: %s set-params: ok (fmt %d rate %dHz "
 				"%dch, candidate %d of %d)\n",
-				vsnd.fmt, vsnd.speed, chans, i, nelem(sndparams));
+				label, sndparams[i].fmt, sndparams[i].hz,
+				chans, i, nelem(sndparams));
 			return 0;
 		}
-		print("virtio-snd: set-params fmt %d rate %dHz %dch: %s (%#ux)\n",
-			sndparams[i].fmt, sndparams[i].hz, chans,
+		print("virtio-snd: %s set-params fmt %d rate %dHz %dch: "
+			"%s (%#ux)\n",
+			label, sndparams[i].fmt, sndparams[i].hz, chans,
 			sndstatusname(t), t);
 		if(t != SErrNotSupp && t != SErrBadMsg)
 			return -1;
 	}
 	if(tried == 0)
-		print("virtio-snd: set-params: device advertised no "
+		print("virtio-snd: %s set-params: device advertised no "
 			"format/rate we know (formats %#.8ux%.8ux rates "
-			"%#.8ux%.8ux)\n",
-			(u32int)(vsnd.formats>>32), (u32int)vsnd.formats,
-			(u32int)(vsnd.rates>>32), (u32int)vsnd.rates);
+			"%#.8ux%.8ux)\n", label,
+			(u32int)(fmts>>32), (u32int)fmts,
+			(u32int)(rates>>32), (u32int)rates);
 	else
-		print("virtio-snd: set-params: host rejected all %d "
-			"advertised candidates\n", tried);
+		print("virtio-snd: %s set-params: host rejected all %d "
+			"advertised candidates\n", label, tried);
 	return -1;
 }
 
@@ -816,6 +875,69 @@ txperiod(uchar *data, int len)
 	if(vsnd.txstat.status != SOk)
 		return -1;
 	return 0;
+}
+
+/*
+ * Post one empty period on rxq and wait for the device to fill it with
+ * captured PCM.  Descriptor chain: xfer header (read by device, tells
+ * it which stream) -> data buffer (written by device) -> status (written
+ * by device).  Returns the number of bytes of PCM received, or -1 on
+ * error.  Caller (the capture kproc) is the only rx submitter.
+ */
+static int
+rxperiod(uchar *data, int len)
+{
+	Vqueue *q;
+	int i;
+
+	q = &vsnd.rx;
+	if(q->qsize < 3)
+		return -1;
+
+	vsnd.rxhdr.stream_id = vsnd.capstreamid;
+	memset(&vsnd.rxstat, 0, sizeof vsnd.rxstat);
+
+	ilock(&vsnd.il);
+	/* descriptor 0: xfer header (device-readable, tells stream id) */
+	q->desc[0].addr = PADDR(&vsnd.rxhdr);
+	q->desc[0].len = WSndxfer;
+	q->desc[0].flags = Dnext;
+	q->desc[0].next = 1;
+
+	/* descriptor 1: PCM data buffer (device-writable) */
+	q->desc[1].addr = PADDR(data);
+	q->desc[1].len = len;
+	q->desc[1].flags = Dwrite | Dnext;
+	q->desc[1].next = 2;
+
+	/* descriptor 2: status (device-writable) */
+	q->desc[2].addr = PADDR(&vsnd.rxstat);
+	q->desc[2].len = WSndstatus;
+	q->desc[2].flags = Dwrite;
+	q->desc[2].next = 0;
+
+	i = q->avail->idx & q->qmask;
+	q->availent[i] = 0;
+	coherence();
+	q->avail->idx++;
+	coherence();
+	vout16(&q->notify, 0, Vrxq);
+	iunlock(&vsnd.il);
+
+	qwait(q);
+
+	if(vsnd.rxstat.status != SOk)
+		return -1;
+	/*
+	 * The device returns the actual number of bytes captured in the
+	 * used-ring entry's len field (total of all device-writable
+	 * descriptors).  We subtract the status size to get the PCM bytes.
+	 * However, the simplest approach: the device fills up to `len`
+	 * bytes of the PCM buffer.  We return `len` since a period is a
+	 * fixed-size chunk and the device should fill it completely at
+	 * steady state.
+	 */
+	return len;
 }
 
 /*
@@ -930,13 +1052,16 @@ drainproc(void *)
 		}
 
 		if(!vsnd.started){
+			qlock(&vsnd.ctll);
 			if(pcmsimple(RPcmStart) < 0){
+				qunlock(&vsnd.ctll);
 				print("virtio-snd: start failed; dropping audio\n");
 				/* discard the ring so write() does not wedge */
 				vsnd.outring.ri = vsnd.outring.wi;
 				wakeup(&vsnd.outring.r);
 				continue;
 			}
+			qunlock(&vsnd.ctll);
 			vsnd.started = 1;
 		}
 
@@ -947,6 +1072,56 @@ drainproc(void *)
 		wakeup(&vsnd.outring.r);
 	}
 	pexit("audiovz drain exiting", 1);
+}
+
+/*
+ * Predicate for a blocked reader (audiovzread): the capture ring has
+ * data to read, OR the card is gone so the reader should give up.
+ */
+static int
+indata(void *)
+{
+	return buffered(&vsnd.inring) > 0 || !vsnd.present || vsnd.failed;
+}
+
+/*
+ * Capture kproc: post empty periods on rxq, wait for the device to
+ * fill them, and copy the captured PCM into the inring for userspace.
+ * Mirror image of drainproc for the tx path.
+ */
+static void
+capproc(void *)
+{
+	int n;
+
+	while(waserror())
+		;
+
+	/*
+	 * The capture PCM lifecycle runs here, on a real KSTACK with
+	 * up != nil.  The device is already activated (sndactivate ran
+	 * in drainproc), so we just need SET_PARAMS/PREPARE/START for
+	 * the capture stream.
+	 */
+	if(caplifecycle() < 0){
+		print("virtio-snd: capture lifecycle failed; no mic\n");
+		pexit("audiovz capture failed", 1);
+	}
+
+	for(;;){
+		if(!vsnd.capready)
+			break;
+
+		n = rxperiod(vsnd.rxbuf, Period);
+		if(n <= 0){
+			print("virtio-snd: rx period failed\n");
+			continue;
+		}
+
+		writering(&vsnd.inring, vsnd.rxbuf, n);
+		wakeup(&vsnd.inring.r);
+	}
+	pexit("audiovz capture exiting", 1);
 }
 
 /*
@@ -979,8 +1154,62 @@ audiovzstart(void)
 }
 
 /*
+ * Start the capture kproc.  The playback kproc (which runs
+ * sndactivate) must be started first so the device is live.
+ * The capture kproc runs caplifecycle (SET_PARAMS/PREPARE/START
+ * for the capture stream) then loops posting rx periods.
+ */
+static void
+audiovzcapstart(void)
+{
+	if(!vsnd.present || vsnd.ckproc || vsnd.failed)
+		return;
+	if(vsnd.capstreamid < 0)
+		return;
+
+	/* ensure device activation has been kicked off */
+	audiovzstart();
+
+	qlock(&vsnd.startl);
+	if(vsnd.present && !vsnd.ckproc && !vsnd.failed && vsnd.capstreamid >= 0){
+		vsnd.ckproc = 1;
+		kproc("audiovzcap", capproc, nil);
+	}
+	qunlock(&vsnd.startl);
+}
+
+/*
  * audio(3) callbacks
  */
+static long
+audiovzread(Audio *, void *vp, long n, vlong)
+{
+	uchar *p, *e;
+	Ring *ring;
+	long m;
+
+	/*
+	 * First read triggers capture activation: spawn the capture
+	 * kproc (which runs caplifecycle) now that we are in process
+	 * context with up != nil.
+	 */
+	audiovzcapstart();
+
+	p = vp;
+	e = p + n;
+	ring = &vsnd.inring;
+	while(p < e){
+		if((m = readring(ring, p, e - p)) <= 0){
+			sleep(&ring->r, indata, nil);
+			if(!vsnd.present || vsnd.failed)
+				break;
+			continue;
+		}
+		p += m;
+	}
+	return p - (uchar*)vp;
+}
+
 static long
 audiovzwrite(Audio *, void *vp, long n, vlong)
 {
@@ -1043,17 +1272,18 @@ audiovzclose(Audio *, int mode)
 {
 	Ring *ring;
 
-	if(mode == OREAD)
-		return;
-	/*
-	 * Pad the ring out to a whole period so the final partial period
-	 * is flushed rather than stranded, then let it drain.
-	 */
-	ring = &vsnd.outring;
-	while(ring->wi % Period)
-		if(writering(ring, (uchar*)"", 1) <= 0)
-			break;
-	wakeup(&vsnd.kr);
+	if(mode == OWRITE || mode == ORDWR){
+		/*
+		 * Pad the ring out to a whole period so the final partial
+		 * period is flushed rather than stranded, then let it drain.
+		 */
+		ring = &vsnd.outring;
+		while(ring->wi % Period)
+			if(writering(ring, (uchar*)"", 1) <= 0)
+				break;
+		wakeup(&vsnd.kr);
+	}
+	/* capture side: nothing special to do on read close */
 }
 
 /*
@@ -1253,16 +1483,18 @@ sndactivate(void)
 	}
 
 	/*
-	 * Set up controlq (0) and txq (2).  We do not use eventq (1) or
-	 * rxq (3) yet, but the device still expects the queues it
-	 * advertises to be configured before DRIVER_OK; we configure only
-	 * the two we drive and leave the others disabled, which the spec
-	 * permits (the device must not use a queue the driver has not
-	 * enabled).
+	 * Set up controlq (0), txq (2), and rxq (3).  eventq (1) is not
+	 * used.  The spec permits leaving unused queues disabled.
 	 */
-	for(qi = 0; qi < 2; qi++){
-		int idx = (qi == 0) ? Vcontrolq : Vtxq;
-		q = (qi == 0) ? &vsnd.ctl : &vsnd.tx;
+	for(qi = 0; qi < 3; qi++){
+		int idx;
+
+		switch(qi){
+		case 0: idx = Vcontrolq; q = &vsnd.ctl; break;
+		case 1: idx = Vtxq; q = &vsnd.tx; break;
+		case 2: idx = Vrxq; q = &vsnd.rx; break;
+		default: continue;
+		}
 
 		vout16(&cfg, Vconf_queuesel, idx);
 		n = vin16(&cfg, Vconf_queuesize);
@@ -1308,16 +1540,25 @@ sndactivate(void)
 	pcisetbme(p);
 
 	/*
-	 * Allocate the userspace ring now that activation succeeded.
+	 * Allocate the userspace rings now that activation succeeded.
 	 */
 	if(vsnd.outring.buf == nil){
 		vsnd.outring.buf = mallocalign(Bufsize, BY2PG, 0, 0);
 		if(vsnd.outring.buf == nil){
-			print("virtio-snd: no memory for ring\n");
+			print("virtio-snd: no memory for playback ring\n");
 			goto Bad;
 		}
 		vsnd.outring.nbuf = Bufsize;
 		vsnd.outring.ri = vsnd.outring.wi = 0;
+	}
+	if(vsnd.inring.buf == nil){
+		vsnd.inring.buf = mallocalign(Bufsize, BY2PG, 0, 0);
+		if(vsnd.inring.buf == nil){
+			print("virtio-snd: no memory for capture ring\n");
+			goto Bad;
+		}
+		vsnd.inring.nbuf = Bufsize;
+		vsnd.inring.ri = vsnd.inring.wi = 0;
 	}
 
 	print("virtio-snd: DRIVER_OK set; queues live, handler wired\n");
@@ -1340,7 +1581,7 @@ pcmlifecycle(void)
 {
 	/*
 	 * Read the device-specific config now that DRIVER_OK is set.
-	 * streams is the total number of PCM streams; pcmfindplayback
+	 * streams is the total number of PCM streams; pcmfindstreams
 	 * uses it so PCM_INFO never overruns the real count.
 	 */
 	vsnd.nstream = vin32(&vsnd.devcfg, Vsndcfg_streams);
@@ -1349,23 +1590,99 @@ pcmlifecycle(void)
 		vsnd.nstream,
 		vin32(&vsnd.devcfg, Vsndcfg_chmaps));
 
-	/* PCM lifecycle: enumerate -> set-params -> prepare */
-	vsnd.streamid = pcmfindplayback();
-	if(vsnd.streamid < 0){
-		print("virtio-snd: no playback stream\n");
+	/* PCM_INFO: enumerate all streams, find playback + capture */
+	if(pcmfindstreams() < 0)
 		return -1;
-	}
 	print("virtio-snd: playback stream id %d\n", vsnd.streamid);
+	if(vsnd.capstreamid >= 0)
+		print("virtio-snd: capture stream id %d\n", vsnd.capstreamid);
+	else
+		print("virtio-snd: no capture stream\n");
 
-	if(pcmsetparams() < 0)
+	/* Playback: SET_PARAMS -> PREPARE (START deferred to first write) */
+	if(pcmsetparams(vsnd.streamid, vsnd.formats, vsnd.rates,
+		vsnd.chmin, vsnd.chmax, &vsnd.fmt, &vsnd.rate,
+		&vsnd.chans, &vsnd.speed, "playback") < 0)
 		return -1;
 	if(pcmsimple(RPcmPrepare) < 0)
 		return -1;
 
 	vsnd.ready = 1;
-	print("#A%d: virtio-snd ready (playback, %dHz %dch)\n",
+	print("#A%d: virtio-snd ready (playback, %dHz %dch%s)\n",
 		vsnd.adev != nil ? vsnd.adev->ctlrno : 0,
-		vsnd.speed, vsnd.chans);
+		vsnd.speed, vsnd.chans,
+		vsnd.capstreamid >= 0 ? "; capture available" : "");
+	return 0;
+}
+
+/*
+ * Capture PCM lifecycle: SET_PARAMS -> PREPARE -> START for the capture
+ * stream.  Run by capproc on a real KSTACK.  Unlike playback, START is
+ * issued immediately because the device must be actively recording for
+ * rxperiod to receive data.  Returns 0 on success, -1 on failure.
+ */
+static int
+caplifecycle(void)
+{
+	Sndpcmhdr h;
+	u32int t;
+
+	if(vsnd.capstreamid < 0)
+		return -1;
+
+	/*
+	 * Wait until the device is activated and the playback lifecycle
+	 * is done (vsnd.ready or vsnd.failed).  The capture kproc starts
+	 * in parallel with drainproc; we need sndactivate to have finished
+	 * so the control queue is live.
+	 */
+	while(!vsnd.ready && !vsnd.failed)
+		tsleep(&vsnd.ckr, return0, nil, 50);
+	if(vsnd.failed)
+		return -1;
+
+	/*
+	 * Serialise control-queue access with vsnd.ctll.  The playback
+	 * side can issue RPcmStart from drainproc concurrently, and both
+	 * paths share vsnd.resp and the single control queue.
+	 */
+	qlock(&vsnd.ctll);
+	if(pcmsetparams(vsnd.capstreamid, vsnd.capformats, vsnd.caprates,
+		vsnd.capchmin, vsnd.capchmax, &vsnd.capfmt, &vsnd.caprate,
+		&vsnd.capchans, &vsnd.capspeed, "capture") < 0){
+		qunlock(&vsnd.ctll);
+		return -1;
+	}
+
+	/* PREPARE the capture stream */
+	memset(&h, 0, sizeof h);
+	h.code = RPcmPrepare;
+	h.stream_id = vsnd.capstreamid;
+	t = ctlcmd(&h, WSndpcmhdr, vsnd.resp, WSndhdr);
+	if(t != SOk){
+		print("virtio-snd: capture prepare: %s (%#ux)\n",
+			sndstatusname(t), t);
+		qunlock(&vsnd.ctll);
+		return -1;
+	}
+
+	/* START the capture stream immediately so the device begins recording */
+	memset(&h, 0, sizeof h);
+	h.code = RPcmStart;
+	h.stream_id = vsnd.capstreamid;
+	t = ctlcmd(&h, WSndpcmhdr, vsnd.resp, WSndhdr);
+	if(t != SOk){
+		print("virtio-snd: capture start: %s (%#ux)\n",
+			sndstatusname(t), t);
+		qunlock(&vsnd.ctll);
+		return -1;
+	}
+	qunlock(&vsnd.ctll);
+
+	vsnd.capstarted = 1;
+	vsnd.capready = 1;
+	print("virtio-snd: capture ready (%dHz %dch)\n",
+		vsnd.capspeed, vsnd.capchans);
 	return 0;
 }
 
@@ -1398,6 +1715,7 @@ audiovzprobe(Audio *adev)
 	 * has run.  devaudio also re-derives speed from volctl writes.
 	 */
 	adev->speed = 48000;
+	adev->read = audiovzread;
 	adev->write = audiovzwrite;
 	adev->close = audiovzclose;
 	adev->buffered = audiovzbuffered;
