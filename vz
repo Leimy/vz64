@@ -23,6 +23,7 @@ dev
 	pci	pci
 	sd
 	audio
+	vsock	pci virtio10mem
 
 link
 	usbxhcipci	pci usbxhci
@@ -34,6 +35,7 @@ link
 	pciqemu		pci
 	uartvz		pci virtio10mem
 	audiovz		pci virtio10mem
+	devvsock	pci virtio10mem
 
 ip
 	tcp
