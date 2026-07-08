@@ -63,7 +63,29 @@ enum {
 	HostCid		= 2,		/* well-known host CID */
 
 	NCONV		= 64,		/* fixed conversation table size */
-	Credit		= 64*1024,	/* fixed per-conversation logical receive window */
+	/*
+	 * Fixed per-conversation logical receive window: the buf_alloc
+	 * we advertise to the peer.  Was 64*1024; bumped to 256*1024
+	 * after vsbulk self-RSTs were traced (vsock-vs-tcp-notes.md
+	 * section 8).  The traces show the HOST DOES NOT STRICTLY
+	 * HONOR the advertised window: at the failure point it had
+	 * sent past (our last reported fwd_cnt + buf_alloc), which a
+	 * compliant peer never does -- fc is monotonic and reported
+	 * after the fact, so a peer's stale view can only make it
+	 * MORE conservative, and ../port/qio.c's one-overshoot
+	 * admission (qpass() accepts the block that crosses the limit,
+	 * rejecting only a FURTHER one) means every packet a compliant
+	 * peer may legally send gets accepted, modulo a ~100B/block
+	 * BALLOC accounting gap far smaller than any observed packet.
+	 * The host instead appears to stream against its own ~256KB
+	 * internal buffering (it advertises buf_alloc 262144 for its
+	 * own receive side, and its post-RST pipelined backlog measured
+	 * ~240KB), so matching that size makes its worst observed
+	 * burst fit.  cv->rq is additionally opened with slack beyond
+	 * this (see vsockopen) so moderate overruns are absorbed
+	 * rather than RST.
+	 */
+	Credit		= 256*1024,
 
 	/*
 	 * Payload-buffer counts (upper bounds on Vqueue.nbuf), NOT
@@ -77,8 +99,39 @@ enum {
 	Nevdesc		= 8,
 
 	Rxbufsz		= Credit + 128,		/* header + up to one full window */
-	Txchunk		= 4096,			/* max payload bytes per RW packet we send */
-	Txbufsz		= Txchunk + 128,
+	/*
+	 * Outbound packetization.  Every data write is chunked into
+	 * RW packets of at most vstxchunk payload bytes, and each
+	 * packet costs one avail-ring submission plus one MMIO kick
+	 * (vout16 on the notify register) -- a trap out to the host
+	 * VMM.  At the measured ~330MB/s bulk rate with 4096-byte
+	 * chunks that is one kick every ~12us, which is suspiciously
+	 * close to plausible per-trap cost, i.e. the kick rate (not
+	 * memcpy, not the wire) may be what caps throughput.  To
+	 * measure that without a rebuild per value, the chunk size is
+	 * a runtime tunable (vstxchunk, "txchunk N" on /net/vsock/ctl,
+	 * default Txchunk) clamped to Txchunkmax, the size the tx
+	 * payload buffers are actually allocated at during boot.
+	 * Txchunkmax at 64K costs 32 x (64K+128) ~= 2.1MB of boot-time
+	 * allocation (vs ~130KB before); acceptable next to the rx
+	 * buffers' ~8.4MB.
+	 *
+	 * The sweep this comment anticipated has been run (devsock.md
+	 * section 4, "txchunk sweep"): 4096/8192/16384/32768/65536,
+	 * three vsbulk runs each.  Throughput rose monotonically with
+	 * chunk size through 32768 (mean ~529 -> 639 -> 690 -> 719
+	 * MB/s) but 65536 -- one full Txbufsz per packet, halving the
+	 * number of packets in flight for a given byte count relative
+	 * to 32768 against the fixed Ntxdesc buffer pool -- went
+	 * unstable (513-710 MB/s, ~6x the spread) instead of
+	 * continuing to improve.  32768 wins on both mean and
+	 * stability and is now the compiled-in default; the knob
+	 * remains live for regression checks, not as a tunable anyone
+	 * is expected to touch in normal use.
+	 */
+	Txchunk		= 32768,		/* default payload bytes per RW packet (see vstxchunk); devsock.md section 4 */
+	Txchunkmax	= 64*1024,		/* hard cap; tx buffers are allocated this big */
+	Txbufsz		= Txchunkmax + 128,
 	Evbufsz		= 8,			/* struct virtio_vsock_event { le32 id; }, rounded up */
 
 	Vshdrsz		= 44,		/* wire size of virtio_vsock_hdr; NEVER sizeof(Vshdr) -- see below */
@@ -106,6 +159,7 @@ enum {
 	Qtopdir		= 0,	/* device root; single child "vsock" (Qprotodir) */
 	Qprotodir,		/* the "vsock" directory: clone + numbered conversations */
 	Qclone,
+	Qgctl,			/* /net/vsock/ctl -- global control: "debug on|off", "txchunk N" */
 	Qconvdir,
 	Qctl,
 	Qdata,
@@ -253,12 +307,32 @@ static char Ereset[] = "vsock: connection reset";
 static char Erefused[] = "vsock: connection refused";
 
 /*
- * Temporary diagnostic tracing: one console line per packet sent
- * and received (op, tuple, len, credit fields).  Cheap enough for
- * connect/hang debugging; set back to 0 before taking latency
- * numbers, since a print per RW packet dominates the round trip.
+ * Diagnostic tracing: one console line per packet sent and received
+ * (op, tuple, len, credit fields).  Cheap enough for connect/hang
+ * debugging but a print per RW packet dominates round-trip time, so
+ * it must be OFF before taking any latency/throughput numbers.
+ *
+ * Toggled live via /net/vsock/ctl (Qgctl below), NOT a recompile:
+ *	echo debug on >/net/vsock/ctl
+ *	echo debug off >/net/vsock/ctl
+ *	cat /net/vsock/ctl		# -> "debug 0" or "debug 1"
+ * This is a separate file from each conversation's own N/ctl (which
+ * only accepts connect/hangup) -- there is exactly one debug switch
+ * for the whole device, not one per conversation.
  */
 static int vsdebug = 0;
+
+/*
+ * Runtime outbound chunk size -- see the Txchunk/Txchunkmax comment
+ * in the enum above.  Set via "txchunk N" on /net/vsock/ctl,
+ * validated there to 512..Txchunkmax; read back via cat.  This is a
+ * measurement knob in the same spirit as vsdebug: once the sweep
+ * says what the right value is, that value should become the
+ * compiled-in Txchunk default, and the knob stays for future
+ * regression checks rather than as a thing anyone is expected to
+ * tune in normal use.
+ */
+static int vstxchunk = Txchunk;
 
 static void vssendraw(uvlong, u32int, uvlong, u32int, u16int, u32int, u32int, u32int, void*, u32int);
 static void vssendctl(Vsconv*, u16int, u32int);
@@ -469,8 +543,8 @@ vssendraw(uvlong dcid, u32int dport, uvlong scid, u32int sport,
 
 	if(!vsock.ready)
 		return;
-	if(len > Txchunk)
-		len = Txchunk;	/* callers must already chunk; this is a safety clamp */
+	if(len > Txchunkmax)
+		len = Txchunkmax;	/* buffer-capacity clamp; callers chunk to vstxchunk, which is <= this */
 
 	if(vsdebug)
 		print("vsock: tx op %ud %llud!%ud -> %llud!%ud len %ud ba %ud fc %ud\n",
@@ -606,11 +680,19 @@ vsockrx(uchar *buf, u32int n)
 			if(paylen > 0){
 				if(cv->rq == nil || qproduce(cv->rq, payload, paylen) != paylen){
 					/*
-					 * Either no room (peer violated the
-					 * credit it was given) or the queue is
-					 * already closed.  Reset rather than
-					 * silently truncate or block the shared
-					 * rx kproc.
+					 * Either the queue is already closed, or
+					 * the peer overran the credit it was
+					 * given: cv->rq's admission limit exceeds
+					 * the advertised buf_alloc (see
+					 * vsockopen), and qio.c's qpass() always
+					 * admits the block that crosses the
+					 * limit, rejecting only a FURTHER one --
+					 * so a peer honoring its window can never
+					 * get here.  (The Apple host has been
+					 * observed overrunning exactly this way;
+					 * see the Credit comment.)  Reset rather
+					 * than silently truncate or block the
+					 * shared rx kproc.
 					 */
 					qunlock(cv);
 					vssendctl(cv, OpRst, 0);
@@ -787,7 +869,7 @@ vsockdatawrite(Vsconv *cv, void *va, long n)
 {
 	uchar *p = va;
 	long tot = 0;
-	u32int chunk, free;
+	u32int chunk, free, tc;
 
 	while(n > 0){
 		qlock(cv);
@@ -816,7 +898,14 @@ vsockdatawrite(Vsconv *cv, void *va, long n)
 		}
 		qunlock(cv);
 
-		chunk = n < Txchunk ? n : Txchunk;
+		/*
+		 * Snapshot vstxchunk once per chunk so the length we
+		 * account in vssenddata is the length vssendraw
+		 * actually sends, even if the ctl knob changes under
+		 * a write in progress.
+		 */
+		tc = vstxchunk;
+		chunk = n < tc ? n : tc;
 		if(chunk > free)
 			chunk = free;
 
@@ -975,6 +1064,70 @@ vsockctlwrite(Vsconv *cv, void *a, long n)
 	return n;
 }
 
+/*
+ * Global control file (/net/vsock/ctl), distinct from each
+ * conversation's own N/ctl.  Two knobs, both global to the device
+ * (never per-conversation) and both safe to change on a live
+ * system:
+ *	debug on|off (or 1|0)	packet-trace prints (vsdebug)
+ *	txchunk N		outbound packetization size in bytes,
+ *				512..Txchunkmax (vstxchunk)
+ * Deliberately NOT exposed here: anything whose storage is sized at
+ * boot (Credit / rx buffer sizes, ring/buffer counts) -- a knob that
+ * silently can't take effect, or worse takes effect unsafely, is a
+ * trap, not a tunable.  Those change by recompile only.
+ *
+ * Not tied to any conversation's generation counter -- see the
+ * special-case in vsockread/vsockwrite that dispatches here before
+ * the per-conversation gen check, since this file has no associated
+ * Vsconv and must keep working regardless of what has happened to
+ * conversation slot 0.
+ */
+static long
+vsockgctlwrite(void *a, long n)
+{
+	Cmdbuf *cb;
+	int v;
+
+	cb = parsecmd(a, n);
+	if(waserror()){
+		free(cb);
+		nexterror();
+	}
+	if(cb->nf < 1)
+		error("short control request");
+	if(strcmp(cb->f[0], "debug") == 0){
+		if(cb->nf < 2)
+			error("debug needs on/off (or 1/0)");
+		if(strcmp(cb->f[1], "on") == 0 || strcmp(cb->f[1], "1") == 0)
+			vsdebug = 1;
+		else if(strcmp(cb->f[1], "off") == 0 || strcmp(cb->f[1], "0") == 0)
+			vsdebug = 0;
+		else
+			error("debug needs on/off (or 1/0)");
+	}else if(strcmp(cb->f[0], "txchunk") == 0){
+		if(cb->nf < 2)
+			error("txchunk needs a byte count (512..65536)");
+		v = strtol(cb->f[1], nil, 0);
+		if(v < 512 || v > Txchunkmax)
+			error("txchunk out of range (512..65536)");
+		vstxchunk = v;
+	}else
+		error("unknown control request");
+	free(cb);
+	poperror();
+	return n;
+}
+
+static long
+vsockgctlread(void *a, long n, vlong off)
+{
+	char buf[64];
+
+	snprint(buf, sizeof buf, "debug %d\ntxchunk %d\n", vsdebug, vstxchunk);
+	return readstr(off, a, n, buf);
+}
+
 static long
 vsockstatusread(Vsconv *cv, void *a, long n, vlong off)
 {
@@ -1017,15 +1170,37 @@ vsockconvclose(Vsconv *cv)
 
 	vsockhangup(cv);
 
-	ilock(&convtab);
+	/*
+	 * cv's own QLock and convtab's ilock are taken one at a time
+	 * here, never nested: qlock(cv) can block/sched(), which is
+	 * illegal while convtab's spinlock is held (caught live by
+	 * qlock()/eqlock()'s own m->ilockdepth check -- this exact
+	 * nesting used to be here and was firing "qlock: ...
+	 * ilockdepth 1" on the console during vsbulk teardown). See
+	 * vsockopen()'s Qclone case for the same pattern already in
+	 * use ("qopen can block/allocate; do it outside convtab's
+	 * spinlock").
+	 *
+	 * This narrows, but does not fully close, the same class of
+	 * race already accepted in the comment above this function:
+	 * cv->state becomes Sclosed here slightly before cv->gen is
+	 * bumped below, so in principle a concurrent vsockopen(clone)
+	 * could observe state==Sclosed under its own ilock(&convtab)
+	 * and start reusing this slot before gen++ has happened.
+	 * Accepted for the same reason: NCONV is small, this is not a
+	 * security boundary, and the alternative (nesting the locks)
+	 * is an outright locking-order bug, not just a narrow race.
+	 */
 	qlock(cv);
 	cv->state = Sclosed;
-	cv->gen++;
-	free(cv->owner);
-	cv->owner = nil;
 	rq = cv->rq;
 	cv->rq = nil;
 	qunlock(cv);
+
+	ilock(&convtab);
+	cv->gen++;
+	free(cv->owner);
+	cv->owner = nil;
 	iunlock(&convtab);
 
 	if(rq != nil)
@@ -1084,7 +1259,12 @@ vsockgen(Chan *c, char*, Dirtab*, int, int s, Dir *dp)
 			devdir(c, q, "clone", 0, eve, 0666, dp);
 			return 1;
 		}
-		i = s - 1;
+		if(s == 1){
+			mkqid(&q, QID(0, Qgctl), 0, QTFILE);
+			devdir(c, q, "ctl", 0, eve, 0666, dp);
+			return 1;
+		}
+		i = s - 2;
 		if(i < 0 || i >= convtab.nused)
 			return -1;
 		cv = &convtab.conv[i];
@@ -1103,6 +1283,18 @@ vsockgen(Chan *c, char*, Dirtab*, int, int s, Dir *dp)
 			return -1;
 		mkqid(&q, QID(0, Qclone), 0, QTFILE);
 		devdir(c, q, "clone", 0, eve, 0666, dp);
+		return 1;
+
+	case Qgctl:
+		if(s == DEVDOTDOT){
+			mkqid(&q, QID(0, Qprotodir), 0, QTDIR);
+			devdir(c, q, "vsock", 0, eve, DMDIR|0555, dp);
+			return 1;
+		}
+		if(s > 0)
+			return -1;
+		mkqid(&q, QID(0, Qgctl), 0, QTFILE);
+		devdir(c, q, "ctl", 0, eve, 0666, dp);
 		return 1;
 
 	case Qconvdir:
@@ -1214,8 +1406,19 @@ vsockopen(Chan *c, int omode)
 			convtab.nused = i+1;
 		iunlock(&convtab);
 
-		/* qopen can block/allocate; do it outside convtab's spinlock */
-		cv->rq = qopen(Credit, 0, nil, nil);
+		/*
+		 * qopen can block/allocate; do it outside convtab's
+		 * spinlock.  The admission limit is 2*Credit while we
+		 * advertise only Credit as buf_alloc: the limit is pure
+		 * accounting (nothing is preallocated), qio.c counts
+		 * BALLOC() bytes (payload plus ~Hdrspc+Tlrspc per block)
+		 * against it and rejects outright at the edge, and the
+		 * host has been observed overrunning the advertised
+		 * window (see the Credit comment) -- the free slack
+		 * absorbs moderate overruns instead of RSTing them.  A
+		 * compliant peer never comes near the extra headroom.
+		 */
+		cv->rq = qopen(2*Credit, 0, nil, nil);
 		if(cv->rq == nil){
 			ilock(&convtab);
 			cv->nref = 0;
@@ -1224,6 +1427,10 @@ vsockopen(Chan *c, int omode)
 		}
 		kstrdup(&cv->owner, up->user);
 		mkqid(&c->qid, QID(i, Qctl), cv->gen, QTFILE);
+		break;
+
+	case Qgctl:
+		/* global, no per-conversation state to allocate */
 		break;
 
 	case Qctl:
@@ -1285,6 +1492,15 @@ vsockread(Chan *c, void *a, long n, vlong off)
 	if(c->qid.type & QTDIR)
 		return devdirread(c, a, n, nil, 0, vsockgen);
 
+	/*
+	 * Qgctl is not tied to any conversation and must keep working
+	 * regardless of what has happened to slot 0's generation, so
+	 * it is special-cased ahead of the per-conversation gen check
+	 * below (see the comment on vsockgctlwrite).
+	 */
+	if(QTYPE(c->qid.path) == Qgctl)
+		return vsockgctlread(a, n, off);
+
 	cv = &convtab.conv[QCONV(c->qid.path)];
 	if(cv->gen != c->qid.vers)
 		error(Ehungup);
@@ -1324,6 +1540,9 @@ vsockwrite(Chan *c, void *a, long n, vlong)
 
 	if(c->qid.type & QTDIR)
 		error(Eisdir);
+
+	if(QTYPE(c->qid.path) == Qgctl)
+		return vsockgctlwrite(a, n);
 
 	cv = &convtab.conv[QCONV(c->qid.path)];
 	if(cv->gen != c->qid.vers)
