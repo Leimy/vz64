@@ -239,6 +239,7 @@ struct Vsconv
 	QLock;
 	Rendez	connr;		/* connect() waits here for RESPONSE/RST/hangup */
 	Rendez	txr;		/* blocked writers wait here for credit */
+	QLock	txwl;		/* serialises whole data writes -- see vsockdatawrite */
 
 	int	state;
 	ulong	gen;		/* generation; bumped whenever the slot is freed */
@@ -695,6 +696,19 @@ vsockrx(uchar *buf, u32int n)
 					 * shared rx kproc.
 					 */
 					qunlock(cv);
+					/*
+					 * Unconditional: connection-fatal and
+					 * rare, and distinguishing WHICH of the
+					 * three reset paths killed a session is
+					 * exactly what the drawterm-console
+					 * debugging needed (a self-RST here, an
+					 * OpRst off the wire, and a transport
+					 * reset event all present identically
+					 * to both ends with vsdebug off).
+					 */
+					print("vsock: rx overrun from %llud!%ud -> port %ud (rq %d), sending RST\n",
+						h->srccid, h->srcport, h->dstport,
+						cv->rq == nil? -1: qlen(cv->rq));
 					vssendctl(cv, OpRst, 0);
 					qlock(cv);
 					cv->state = Sreset;
@@ -748,6 +762,10 @@ vsockrx(uchar *buf, u32int n)
 		break;
 
 	case OpRst:
+		/* unconditional -- see the rx-overrun print above */
+		print("vsock: RST from peer %llud!%ud -> port %ud (state %d rx %llud tx %llud)\n",
+			h->srccid, h->srcport, h->dstport,
+			cv->state, cv->rxbytes, cv->txbytes);
 		cv->state = Sreset;
 		if(cv->rq != nil)
 			qhangup(cv->rq, Ereset);
@@ -779,6 +797,9 @@ vsockevent(uchar *buf, u32int n)
 	memmove(&id, buf, sizeof id);
 	if(id != 0)	/* only VIRTIO_VSOCK_EVENT_TRANSPORT_RESET (0) is defined */
 		return;
+
+	/* unconditional -- see the rx-overrun print in vsockrx */
+	print("vsock: transport reset event; resetting all conversations\n");
 
 	for(i = 0; i < NCONV; i++){
 		cv = &convtab.conv[i];
@@ -871,6 +892,32 @@ vsockdatawrite(Vsconv *cv, void *va, long n)
 	long tot = 0;
 	u32int chunk, free, tc;
 
+	/*
+	 * cv->txwl holds this WHOLE write's chunks contiguous on the
+	 * wire.  devmnt (and every other 9P client) issues concurrent
+	 * RPCs from independent procs and relies on the transport
+	 * keeping each write() contiguous -- TCP gets this from qio's
+	 * per-write atomicity.  Without this lock the guarantee here
+	 * held only by accident: a sub-Txchunk write normally goes out
+	 * as a single packet, but the credit-pressure path below
+	 * (chunk = free) splits ONE write into SEVERAL packets with no
+	 * lock held between them, so under sustained bulk tx (exactly
+	 * when credit runs dry) a concurrent writer on the same
+	 * conversation could interleave mid-message and desync the
+	 * peer's 9P stream.  Observed in the wild as drawterm dying
+	 * with "convM2S format error" ~147MB into a heavy-draw console
+	 * session (drawterm-2026-07-09-130313.ips).
+	 *
+	 * eqlock, not qlock: a writer parked here behind one that is
+	 * itself asleep waiting for credit must remain interruptible.
+	 * Raised errors after this point unlock via the waserror below.
+	 */
+	eqlock(&cv->txwl);
+	if(waserror()){
+		qunlock(&cv->txwl);
+		nexterror();
+	}
+
 	while(n > 0){
 		qlock(cv);
 		if(cv->state != Sestablished && cv->state != Sclosing){
@@ -915,6 +962,8 @@ vsockdatawrite(Vsconv *cv, void *va, long n)
 		n -= chunk;
 		tot += chunk;
 	}
+	poperror();
+	qunlock(&cv->txwl);
 	return tot;
 }
 
