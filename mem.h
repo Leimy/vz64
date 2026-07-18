@@ -32,7 +32,13 @@
 #define L1TABLE(v, l)	(L1TABLES - ((PTLX(v, 2) % L1TABLES) >> (((l)-1)*PTSHIFT)) + (l)-1)
 #define L1TOPSIZE	(1ULL << (EVASHIFT - PTLEVELS*PTSHIFT))
 
-#define	MAXMACH		16			/* max # cpus system can run */
+#define	MAXMACH		64			/* max # cpus system can run */
+					/* must stay a power of 2: l.s ANDs
+					 * (MAXMACH-1) into a secondary's
+					 * machno.  128 would leave zero
+					 * room for L1TOP/L1/L1BOT below
+					 * MACHADDR(MAXMACH-1) before hitting
+					 * VDRAM/CONFADDR -- see mem.h layout. */
 #define	MACHSIZE	(8*KiB)
 
 #define KSTACK		(8*KiB)
